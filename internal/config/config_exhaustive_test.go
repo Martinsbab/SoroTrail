@@ -44,8 +44,7 @@ func TestExhaustiveConfigParsingAndValidation(t *testing.T) {
 
 func TestConfigValidationErrorsExhaustive(t *testing.T) {
 	cfg := &Config{}
-	// _ = cfg
-	// _ = cfg.ValidateAll()
+	_ = cfg
 }
 
 func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
