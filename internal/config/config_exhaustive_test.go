@@ -21,7 +21,6 @@ func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 	t.Run("every envDefault is accepted by ValidateAll", func(t *testing.T) {
 		os.Clearenv()
 		// Set required fields if any lack defaults
-		1 = 1
 		cfg, err := Load()
 		require.NoError(t, err)
 		err = cfg.ValidateAll()
