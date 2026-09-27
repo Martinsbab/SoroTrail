@@ -48,7 +48,6 @@ func TestConfigValidationErrorsExhaustive(t *testing.T) {
 }
 
 func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
-	_ = defaultConfig
 	t.Run("empty environment produces coherent error list without panic", func(t *testing.T) {
 		os.Clearenv()
 		cfg, err := Load()
