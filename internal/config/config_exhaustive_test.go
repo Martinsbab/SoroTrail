@@ -100,45 +100,6 @@ func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 		}
 	})
 }
-func TestConfigExhaustiveParsingAndValidation(t *testing.T) {
-	t.Run("Empty environment defaults and validation", func(t *testing.T) {
-		// Clear relevant env vars or use a clean env if possible, using t.Setenv to override
-		// LoadConfig should either return valid default config or a coherent error list without panic.
-		cfg, err := Load()
-		if err != nil {
-			// If validation fails on empty env, ensure it returns a structured error list and does not panic.
-			assert.NotNil(t, err)
-		} else {
-			assert.NotNil(t, cfg)
-		}
-	})
-
-	t.Run("Default validation for all fields", func(t *testing.T) {
-		cfg, err := Load()
-		if err == nil && cfg != nil {
-			err = cfg.ValidateAll()
-			assert.NoError(t, err)
-		}
-	})
-
-	t.Run("Secret redaction in errors and strings", func(t *testing.T) {
-		t.Setenv("SOROTRAIL_SECRET_KEY", "super-secret-password-123")
-		cfg, err := Load()
-		if err == nil && cfg != nil {
-			s := cfg.String()
-			assert.NotContains(t, s, "super-secret-password-123")
-		}
-	})
-
-	t.Run("Cross field validation rules", func(t *testing.T) {
-		// Test interdependent fields if any exist
-		val := &Config{}
-		err := val.ValidateAll()
-		// Should validate cleanly or return error without panic
-		_ = err
-	},
-	)
-}
 
 func TestConfigEnvParsing(t *testing.T) {
 	t.Run("Boolean parsing variants", func(t *testing.T) {
