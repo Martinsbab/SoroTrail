@@ -36,7 +36,7 @@ func TestExhaustiveConfigParsingAndValidation(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://secretuser:secretpassword@localhost:5432/db")
 		cfg, err := Load()
 		if err == nil {
-			str := cfg.String()
+			str := fmt.Sprintf("%+v", cfg)
 			assert.NotContains(t, str, "secretpassword")
 		}
 	})
