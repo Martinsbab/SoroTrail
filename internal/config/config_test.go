@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -24,7 +25,7 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 		t.Setenv("PORT", "8080")
 		cfg, err := Load()
 		if err == nil {
-			assert.Equal(t, 8080, cfg.Port)
+			assert.Equal(t, ":8080", cfg.HTTPAddr)
 		}
 	})
 
@@ -37,7 +38,7 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 
 	t.Run("Secret redaction", func(t *testing.T) {
 		cfg := &Config{}
-		str := cfg.String()
+		str := fmt.Sprintf("%+v", cfg)
 		assert.NotContains(t, str, "secret")
 	})
 }
