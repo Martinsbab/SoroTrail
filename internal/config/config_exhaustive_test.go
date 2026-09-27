@@ -1,10 +1,10 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"testing"
 
+	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -155,4 +155,42 @@ func splitEnv(env string) []string {
 		}
 	}
 	return []string{env, ""}
+}
+func TestConfigExhaustiveParsingAndValidation(t *testing.T) {
+	t.Run("Default config passes validation", func(t *testing.T) {
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+		err = cfg.ValidateAll()
+		assert.NoError(t, err)
+	})
+
+	t.Run("Invalid port configuration fails validation", func(t *testing.T) {
+		t.Setenv("PORT", "invalid-port")
+		cfg, err := Load()
+		if err == nil {
+			err = cfg.ValidateAll()
+		}
+		assert.Error(t, err)
+	})
+
+	t.Run("Secret redaction in string representation or logs", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://user:secretpassword@localhost:5432/db")
+		cfg, err := Load()
+		require.NoError(t, err)
+		// Check that secrets don't leak unmasked if there's a String method or similar
+		cfgStr := cfg.String()
+		assert.NotContains(t, cfgStr, "secretpassword")
+	})
+
+	t.Run("Empty environment yields defaults without panic", func(t *testing.T) {
+		// Clear relevant env vars
+		os.Unsetenv("PORT")
+		os.Unsetenv("DATABASE_URL")
+		cfg, err := Load()
+		// Either loads with defaults or returns structured validation errors, never panic
+		if err == nil {
+			_ = cfg.ValidateAll()
+		}
+	})
 }
