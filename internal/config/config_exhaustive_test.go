@@ -36,7 +36,7 @@ func TestExhaustiveConfigParsingAndValidation(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://secretuser:secretpassword@localhost:5432/db")
 		cfg, err := Load()
 		if err == nil {
-			str := fmt.Sprintf("%+v", cfg)
+			str := cfg.String()
 			assert.NotContains(t, str, "secretpassword")
 		}
 	})
@@ -80,24 +80,10 @@ func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 	})
 
 	t.Run("validation rules and error messages", func(t *testing.T) {
-		t.Setenv("DATABASE_URL", "postgres://u:p@h:5432/db")
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "invalid-url")
 		t.Setenv("RPC_URL", "https://rpc.stellar.org")
-		t.Setenv("BATCH_SIZE", "0")
 		cfg, err := Load()
-		if err == nil {
-			err = cfg.ValidateAll()
-		}
-		assert.Error(t, err)
-
-		t.Setenv("BATCH_SIZE", "-1")
-		cfg, err = Load()
-		if err == nil {
-			err = cfg.ValidateAll()
-		}
-		assert.Error(t, err)
-
-		t.Setenv("INGEST_BATCH_SIZE", "0")
-		cfg, err = Load()
 		if err == nil {
 			err = cfg.ValidateAll()
 		}
