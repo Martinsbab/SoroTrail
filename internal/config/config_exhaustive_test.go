@@ -37,7 +37,7 @@ func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 		t.Setenv("POLL_INTERVAL", "10s")
 		cfg, err := Load()
 		require.NoError(t, err)
-		assert.Equal(t, 9090, cfg.Port)
+		assert.Equal(t, 9090, cfg.ServerPort)
 		assert.Equal(t, "debug", cfg.LogLevel)
 		assert.Equal(t, 50, cfg.BatchSize)
 		assert.Equal(t, 10, int(cfg.PollInterval.Seconds()))
@@ -64,7 +64,7 @@ func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 
 		// Test invalid port
 		t.Setenv("BATCH_SIZE", "10")
-		t.Setenv("PORT", "0")
+		t.Setenv("SERVER_PORT", "0")
 		cfg, err = Load()
 		if err == nil {
 			err = cfg.ValidateAll()
