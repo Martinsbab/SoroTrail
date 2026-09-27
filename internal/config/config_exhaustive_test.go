@@ -151,6 +151,7 @@ func TestExhaustiveConfigDefaults(t *testing.T) {
 func clearEnv(t *testing.T) {
 	for _, env := range os.Environ() {
 		pair := splitEnv(env)
+		// Skip system or test runner env vars if necessary
 		t.Setenv(pair[0], "")
 		_ = os.Unsetenv(pair[0])
 	}
