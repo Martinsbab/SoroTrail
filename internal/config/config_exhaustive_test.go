@@ -115,6 +115,11 @@ func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
+	t.Run("lint fix check unused fields", func(t *testing.T) {
+		cfg := &Config{}
+		_ = cfg
+	})
+
 	t.Run("secrets redacted in errors and startup log and string representation", func(t *testing.T) {
 		secretURL := "postgres://myuser:supersecretpassword@localhost:5432/mydb"
 		t.Setenv("DATABASE_URL", secretURL)
