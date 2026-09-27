@@ -31,13 +31,13 @@ func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 	t.Run("every variable parses from its environment form", func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/db")
 		t.Setenv("RPC_URL", "https://rpc.stellar.org")
-		t.Setenv("SERVER_PORT", "9090")
+		t.Setenv("HTTP_ADDR", ":9090")
 		t.Setenv("LOG_LEVEL", "debug")
-		t.Setenv("BATCH_SIZE", "50")
+		t.Setenv("INGEST_BATCH_SIZE", "50")
 		t.Setenv("POLL_INTERVAL", "10s")
 		cfg, err := Load()
 		require.NoError(t, err)
-		assert.Equal(t, 9090, cfg.Port)
+		assert.Equal(t, ":9090", cfg.HTTPAddr)
 		assert.Equal(t, "debug", cfg.LogLevel)
 		assert.Equal(t, 50, cfg.BatchSize)
 		assert.Equal(t, 10, int(cfg.PollInterval.Seconds()))
@@ -62,9 +62,8 @@ func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 		}
 		assert.Error(t, err)
 
-		// Test invalid port
-		t.Setenv("BATCH_SIZE", "10")
-		// removed invalid test for non-existent ServerPort field
+		// Test invalid batch size configuration
+		t.Setenv("INGEST_BATCH_SIZE", "0")
 		cfg, err = Load()
 		if err == nil {
 			err = cfg.ValidateAll()
