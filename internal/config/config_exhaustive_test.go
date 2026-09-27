@@ -1,10 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
-	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
