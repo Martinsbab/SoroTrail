@@ -121,14 +121,15 @@ func TestExhaustiveConfigParsingAndValidation(t *testing.T) {
 		if err != nil {
 			assert.NotNil(t, err)
 		} else {
-			assert.NotNil(t, cfg)
+			// Load returns a Config value, not a pointer
+			_, _ = fmt.Sprintf("%+v", cfg), cfg
 		}
 	})
 
 	t.Run("envDefault values validate successfully", func(t *testing.T) {
 		clearEnv(t)
 		cfg, err := Load()
-		if err == nil && cfg != nil {
+		if err == nil {
 			err = cfg.ValidateAll()
 			assert.NoError(t, err)
 		}
@@ -138,8 +139,8 @@ func TestExhaustiveConfigParsingAndValidation(t *testing.T) {
 		clearEnv(t)
 		t.Setenv("DATABASE_URL", "postgres://secretuser:secretpassword@localhost:5432/db")
 		cfg, err := Load()
-		if err == nil && cfg != nil {
-			str := cfg.String()
+		if err == nil {
+			str := fmt.Sprintf("%+v", cfg)
 			assert.NotContains(t, str, "secretpassword")
 		}
 	})
