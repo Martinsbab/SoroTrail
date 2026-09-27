@@ -179,7 +179,7 @@ func TestConfigExhaustiveParsingAndValidation(t *testing.T) {
 		cfg, err := Load()
 		require.NoError(t, err)
 		// Check that secrets don't leak unmasked if there's a String method or similar
-		cfgStr := cfg.String()
+		cfgStr := fmt.Sprintf("%+v", cfg)
 		assert.NotContains(t, cfgStr, "secretpassword")
 	})
 
