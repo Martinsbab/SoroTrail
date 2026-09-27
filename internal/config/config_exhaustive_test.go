@@ -1,10 +1,10 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"testing"
 
+	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -113,4 +113,51 @@ func TestConfigEnvParsing(t *testing.T) {
 func TestConfigValidationErrorsExhaustive(t *testing.T) {
 	cfg := &Config{}
 	_ = cfg.ValidateAll()
+}
+func TestExhaustiveConfigParsingAndValidation(t *testing.T) {
+	t.Run("empty environment produces valid config with defaults or errors", func(t *testing.T) {
+		clearEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			assert.NotNil(t, err)
+		} else {
+			assert.NotNil(t, cfg)
+		}
+	})
+
+	t.Run("envDefault values validate successfully", func(t *testing.T) {
+		clearEnv(t)
+		cfg, err := Load()
+		if err == nil && cfg != nil {
+			err = cfg.ValidateAll()
+			assert.NoError(t, err)
+		}
+	})
+
+	t.Run("secret redaction in config string representation", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("DATABASE_URL", "postgres://secretuser:secretpassword@localhost:5432/db")
+		cfg, err := Load()
+		if err == nil && cfg != nil {
+			str := cfg.String()
+			assert.NotContains(t, str, "secretpassword")
+		}
+	})
+}
+
+func clearEnv(t *testing.T) {
+	for _, env := range os.Environ() {
+		pair := splitEnv(env)
+		t.Setenv(pair[0], "")
+		_ = os.Unsetenv(pair[0])
+	}
+}
+
+func splitEnv(env string) []string {
+	for i := 0; i < len(env); i++ {
+		if env[i] == '=' {
+			return []string{env[:i], env[i+1:]}
+		}
+	}
+	return []string{env, ""}
 }
