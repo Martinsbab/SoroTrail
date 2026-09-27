@@ -9,6 +9,39 @@ import (
 	"time"
 )
 
+func TestConfigDefaultsAndValidation(t *testing.T) {
+	t.Run("Default config passes validation", func(t *testing.T) {
+		// Clear relevant env vars to test defaults
+		os.Clearenv()
+		cfg, err := Load()
+		// If Load requires certain vars or fails on empty env, ensure we handle or assert appropriately
+		if err == nil {
+			assert.NotNil(t, cfg)
+		}
+	})
+
+	t.Run("Parse various types and validation rules", func(t *testing.T) {
+		t.Setenv("PORT", "8080")
+		cfg, err := Load()
+		if err == nil {
+			assert.Equal(t, 8080, cfg.Port)
+		}
+	})
+
+	t.Run("ValidateAll catches invalid values", func(t *testing.T) {
+		cfg := &Config{}
+		err := cfg.ValidateAll()
+		// ValidateAll should return errors if required fields are missing
+		assert.Error(t, err)
+	})
+
+	t.Run("Secret redaction", func(t *testing.T) {
+		cfg := &Config{}
+		str := cfg.String()
+		assert.NotContains(t, str, "secret")
+	})
+}
+
 const validContract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
 
 var envKeys = []string{
@@ -1586,37 +1619,5 @@ func TestLoggableFieldsRedactsCredentials(t *testing.T) {
 		assert.NotContains(t, got["rpc_url"], "rpc key")
 		assert.Equal(t, "<redacted>", got["database_url"])
 		assert.Equal(t, "<redacted>", got["rpc_url"])
-	})
-}
-func TestConfigDefaultsAndValidation(t *testing.T) {
-	t.Run("Default config passes validation", func(t *testing.T) {
-		// Clear relevant env vars to test defaults
-		os.Clearenv()
-		cfg, err := Load()
-		// If Load requires certain vars or fails on empty env, ensure we handle or assert appropriately
-		if err == nil {
-			assert.NotNil(t, cfg)
-		}
-	})
-
-	t.Run("Parse various types and validation rules", func(t *testing.T) {
-		t.Setenv("PORT", "8080")
-		cfg, err := Load()
-		if err == nil {
-			assert.Equal(t, 8080, cfg.Port)
-		}
-	})
-
-	t.Run("ValidateAll catches invalid values", func(t *testing.T) {
-		cfg := &Config{}
-		err := cfg.ValidateAll()
-		// ValidateAll should return errors if required fields are missing
-		assert.Error(t, err)
-	})
-
-	t.Run("Secret redaction", func(t *testing.T) {
-		cfg := &Config{}
-		str := cfg.String()
-		assert.NotContains(t, str, "secret")
 	})
 }
