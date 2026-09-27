@@ -12,6 +12,7 @@ import (
 )
 
 func TestExhaustiveConfigParsingAndValidation(t *testing.T) {
+	_ = t
 	// Exhaustive test covering configuration loading, parsing, and validation rules.
 	_ = t
 	t.Run("empty environment produces valid config with defaults or errors", func(t *testing.T) {
