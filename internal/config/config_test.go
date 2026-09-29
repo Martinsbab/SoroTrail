@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,10 +11,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// clearEnv empties the process environment for one test and puts it back
+// afterwards.
+//
+// A bare os.Clearenv() also removes TMP and TEMP, and nothing restores them,
+// so every later test in this package that calls t.TempDir() fails. On Linux
+// that is invisible — os.TempDir falls back to /tmp, which is writable — but
+// on Windows it falls back to C:\Windows and the call is denied. Restoring on
+// cleanup keeps the isolation these tests want without leaking it.
+func clearEnv(t *testing.T) {
+	t.Helper()
+	saved := os.Environ()
+	t.Cleanup(func() {
+		os.Clearenv()
+		for _, kv := range saved {
+			if i := strings.IndexByte(kv, '='); i > 0 {
+				_ = os.Setenv(kv[:i], kv[i+1:])
+			}
+		}
+	})
+	os.Clearenv()
+}
+
 func TestConfigDefaultsAndValidation(t *testing.T) {
 	t.Run("Default config passes validation", func(t *testing.T) {
 		// Clear relevant env vars to test defaults
-		os.Clearenv()
+		clearEnv(t)
 		cfg, err := Load()
 		// If Load requires certain vars or fails on empty env, ensure we handle or assert appropriately
 		if err == nil {

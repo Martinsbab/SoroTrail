@@ -53,14 +53,14 @@ func TestConfigValidationErrorsExhaustive(t *testing.T) {
 
 func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 	t.Run("empty environment produces coherent error list without panic", func(t *testing.T) {
-		os.Clearenv()
+		clearEnv(t)
 		cfg, err := Load()
 		_ = cfg
 		_ = err
 	})
 
 	t.Run("every envDefault is accepted by ValidateAll", func(t *testing.T) {
-		os.Clearenv()
+		clearEnv(t)
 		t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/db")
 		cfg, err := Load()
 		require.NoError(t, err)
@@ -143,23 +143,6 @@ func TestExhaustiveConfigDefaults(t *testing.T) {
 	// Stub to keep golangci-lint / test runners happy if they look for this exact name
 }
 
-func clearEnv(t *testing.T) {
-	for _, env := range os.Environ() {
-		pair := splitEnv(env)
-		// Skip system or test runner env vars if necessary
-		t.Setenv(pair[0], "")
-		_ = os.Unsetenv(pair[0])
-	}
-}
-
-func splitEnv(env string) []string {
-	for i := 0; i < len(env); i++ {
-		if env[i] == '=' {
-			return []string{env[:i], env[i+1:]}
-		}
-	}
-	return []string{env, ""}
-}
 func TestConfigExhaustiveParsingAndValidation(t *testing.T) {
 	t.Run("Default config passes validation", func(t *testing.T) {
 		cfg, err := Load()
