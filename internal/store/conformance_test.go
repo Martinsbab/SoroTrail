@@ -210,16 +210,29 @@ func newPostgresConformanceStore(t *testing.T) Store {
 // is configured. The backend currently declares the behavioural suite
 // unsupported, so this is only reached once those stubs grow real
 // implementations; the gate keeps a missing server a skip, never a failure.
-func newClickHouseConformanceStore(t *testing.T) Store {
+func newClickHouseStoreForTests(t *testing.T) (Store, error) {
 	t.Helper()
 	url := os.Getenv("TEST_CLICKHOUSE_URL")
 	if url == "" {
 		t.Skip("TEST_CLICKHOUSE_URL not set; skipping ClickHouse conformance")
 	}
-	require.NoError(t, Migrate(url))
+	if err := Migrate(url); err != nil {
+		return nil, err
+	}
 	st, err := NewStoreFromURL(url)
+	if err != nil {
+		return nil, err
+	}
+	if err := st.Ping(context.Background()); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+func newClickHouseConformanceStore(t *testing.T) Store {
+	t.Helper()
+	st, err := newClickHouseStoreForTests(t)
 	require.NoError(t, err)
-	require.NoError(t, st.Ping(context.Background()))
 	return st
 }
 
@@ -232,6 +245,7 @@ func testUpsertEventsIdempotent(t *testing.T, st Store) {
 
 	inserted, err = st.UpsertEvents(ctx, events)
 	require.NoError(t, err)
+	assert.Equal(t, int64(0), inserted)
 	assert.Zero(t, inserted, "duplicate IDs are ignored")
 
 	got, err := st.GetEvent(ctx, eventID(1), WildcardScope())
@@ -701,21 +715,6 @@ func TestClickHouse_ConformanceSuite(t *testing.T) {
 	runStoreTests(t, conformanceBackendNamed(t, "clickhouse"))
 }
 
-// newClickHouseStoreForTests attempts to create a ClickHouse store
-// from the environment. Returns an error if no ClickHouse server is
-// reachable, which callers use to skip the test.
-func newClickHouseStoreForTests() (*ClickHouse, error) {
-	url := os.Getenv("CLICKHOUSE_URL")
-	if url == "" {
-		return nil, fmt.Errorf("CLICKHOUSE_URL not set")
-	}
-	st, err := NewStoreFromURL(url)
-	if err != nil {
-		return nil, fmt.Errorf("creating ClickHouse store: %w", err)
-	}
-	return st.(*ClickHouse), nil
-}
-
 // TestClickHouse_Unsupported_Methods asserts that every method
 // not yet implemented in the ClickHouse backend returns an explicit
 // error rather than silently succeeding or panicking.
@@ -746,16 +745,18 @@ func TestClickHouse_Unsupported_Methods(t *testing.T) {
 	assert.ErrorContains(t, err, "not yet implemented for ClickHouse",
 		"ContractEventTypeCounts should return an explicit unsupported error")
 
-	// Per-contract cursors are not supported.
+	// GetContractCursor is implemented on this backend, not stubbed: it
+	// issues a request. On a zero-value ClickHouse there is no server to
+	// reach, so what it must not do is succeed or panic.
 	_, err = st.GetContractCursor(ctx, "test")
-	assert.ErrorIs(t, err, ErrNotFound, "GetContractCursor should return ErrNotFound")
+	assert.Error(t, err, "GetContractCursor must report the failed lookup rather than a zero cursor")
 }
 
 // TestClickHouse_SuiteSkipsCleanly verifies that when no ClickHouse
 // server is available, the conformance suite skips without error.
 func TestClickHouse_SuiteSkipsCleanly(t *testing.T) {
 	// With no CLICKHOUSE_URL set, the conformance test should skip.
-	st, err := newClickHouseStoreForTests()
+	st, err := newClickHouseStoreForTests(t)
 	if err != nil {
 		t.Skip("ClickHouse not available, skipping conformance suite: ", err)
 	}
@@ -769,30 +770,8 @@ func TestClickHouse_SuiteSkipsCleanly(t *testing.T) {
 // assertions against any Store implementation to guarantee that backends agree
 // on ErrNotFound, empty collections, and error handling.
 func RunStoreConformanceSuite(t *testing.T, st Store) {
-	t.Helper()
-	ctx := context.Background()
-
-	t.Run("MissingSingleResourceReturnsErrNotFound", func(t *testing.T) {
-		// Querying a non-existent single resource or state must consistently return ErrNotFound.
-		_, err := st.GetEvent(ctx, "nonexistent-event-id", WildcardScope())
-		assert.ErrorIs(t, err, ErrNotFound)
-	})
-
-	t.Run("EmptyCollectionReturnsEmptySliceNeverErrNotFound", func(t *testing.T) {
-		// Querying collections with no matching records must return an empty result set and nil error.
-		contracts, err := st.ListWatchedContracts(ctx)
-		require.NoError(t, err)
-		assert.Empty(t, contracts)
-
-		// QueryEvents with a scope that matches nothing should return an empty slice and nil error.
-		events, _, err := st.QueryEvents(ctx, EventFilter{Scope: NewScope([]string{"nonexistent-contract-id"}), Limit: 10})
-		require.NoError(t, err)
-		assert.Empty(t, events)
-	})
-
-	t.Run("UnsupportedOrInvalidOperationReturnsExplicitError", func(t *testing.T) {
-		// Operations with invalid parameters or uninitialized states must return an explicit error, never nil.
-		err := st.AddWatchedContract(ctx, "")
-		assert.Error(t, err)
+	runStoreTests(t, conformanceBackend{
+		name:    "custom",
+		factory: func(t *testing.T) Store { return st },
 	})
 }

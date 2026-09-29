@@ -41,7 +41,8 @@ const (
 // is proven separately, against a real database, in
 // internal/store/tenant_postgres_test.go.
 type scopedStore struct {
-	store.Store // panics on anything not implemented here
+	store.Store
+	StoreField store.Store // panics on anything not implemented here
 
 	events []store.Event
 
@@ -168,6 +169,9 @@ type keyRecord struct {
 	id       int64
 	tenantID int64
 	digest   []byte
+	// plaintext records the full key so a test can revoke the key by
+	// deleting its exact prefix entry instead of guessing the split.
+	plaintext string
 }
 
 func newFakeTenants() *fakeTenants {
@@ -189,7 +193,7 @@ func (f *fakeTenants) addTenant(t *testing.T, tenant store.Tenant, grants ...str
 
 	plaintext, prefix, digest, err := GenerateAPIKey()
 	require.NoError(t, err)
-	f.keys[prefix] = keyRecord{id: tenant.ID * 100, tenantID: tenant.ID, digest: digest}
+	f.keys[prefix] = keyRecord{id: tenant.ID * 100, tenantID: tenant.ID, digest: digest, plaintext: plaintext}
 	return plaintext
 }
 
@@ -933,6 +937,8 @@ func TestParseAPIKeyForBootstrapMatchesGeneration(t *testing.T) {
 // return nothing rather than everything. This is the property the whole
 // fail-closed design exists to guarantee.
 func TestForgottenScopeDeniesRatherThanLeaks(t *testing.T) {
+	f := newTenantFixture(t)
+	_ = f
 	st := &scopedStore{events: []store.Event{
 		{ID: "ev-a1", ContractID: contractA},
 		{ID: "ev-b1", ContractID: contractB},

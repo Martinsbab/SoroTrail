@@ -124,26 +124,87 @@ var schemaSurfaces = map[string]reflect.Type{
 	"UpdateSubscriptionRequest": reflect.TypeOf(updateSubscriptionRequest{}),
 }
 
+// unmappedSchemas is the other half of the inventory: schemas openapi.json
+// defines that no single Go type produces, so the checks below cannot compare
+// them against a field set. Most are request bodies or hand-written envelopes
+// that a handler assembles inline. The list exists so that a NEW schema is a
+// failure rather than a silent gap — adding one means either wiring it into
+// schemaSurfaces or naming it here on purpose.
+var unmappedSchemas = map[string]struct{}{
+	"APIKeyRequest":               {},
+	"AddressSummary":              {},
+	"AggregateBucket":             {},
+	"AggregateResponse":           {},
+	"ContractListEnvelope":        {},
+	"ContractListResponse":        {},
+	"ContractSpecOverrideRequest": {},
+	"CurrentTenant":               {},
+	"DeadLetter":                  {},
+	"DeadLettersEnvelope":         {},
+	"DeadLettersPage":             {},
+	"DeliveryEnvelopeResponse":    {},
+	"EventEnvelopeResponse":       {},
+	"EventListResponse":           {},
+	"EventResponse":               {},
+	"EventWithXDR":                {},
+	"GrantContractRequest":        {},
+	"GrantList":                   {},
+	"ProjectedEvent":              {},
+	"Tenant":                      {},
+	"TenantAPIKey":                {},
+	"TenantAPIKeyRequest":         {},
+	"TenantAPIKeysPage":           {},
+	"TenantCreateRequest":         {},
+	"TenantList":                  {},
+	"TenantUpdateRequest":         {},
+	"TenantUsage":                 {},
+	"TenantWatchList":             {},
+	"UsagePage":                   {},
+	"WatchedContract":             {},
+	"WatchedContractAdded":        {},
+	"WatchedContractRemoved":      {},
+	"WatchedContractRequest":      {},
+	"WatchedContractsPage":        {},
+}
+
+// goTypeFor returns the Go type behind a schema, and false when the schema is
+// one of the deliberately unmapped ones.
+func goTypeFor(name string) (reflect.Type, bool) {
+	typ, ok := schemaSurfaces[name]
+	return typ, ok
+}
+
 func TestEverySchemaMapsToAGoType(t *testing.T) {
 	// A schema with no Go counterpart is documentation for a response nobody
 	// writes; a Go type the spec describes under a different name is a rename
-	// that just broke someone's client.
+	// that just broke someone's client. Anything not yet mapped has to be
+	// named in unmappedSchemas, so a new schema cannot slip past unnoticed.
 	schemas := loadSchemaDocument(t)
 	for name := range schemas {
-		assert.Containsf(t, schemaSurfaces, name,
-			"openapi.json defines schema %q, which this test cannot check against a Go type — add it to schemaSurfaces", name)
+		_, mapped := schemaSurfaces[name]
+		_, known := unmappedSchemas[name]
+		assert.Truef(t, mapped || known,
+			"openapi.json defines schema %q, which this test cannot check against a Go type — add it to schemaSurfaces, or to unmappedSchemas if no single Go type produces it", name)
+		assert.Falsef(t, mapped && known,
+			"schema %q is in both schemaSurfaces and unmappedSchemas", name)
 	}
 	for name := range schemaSurfaces {
 		assert.Containsf(t, schemas, name,
 			"schemaSurfaces maps %q to a Go type, but openapi.json no longer defines that schema", name)
+	}
+	for name := range unmappedSchemas {
+		assert.Containsf(t, schemas, name,
+			"unmappedSchemas names %q, but openapi.json no longer defines that schema", name)
 	}
 }
 
 func TestOpenAPISchemasAdvertiseOnlyEmittedKeys(t *testing.T) {
 	schemas := loadSchemaDocument(t)
 	for _, name := range sortedSchemaNames(schemas) {
-		typ, ok := schemaSurfaces[name]
-		require.Truef(t, ok, "schema %q has no entry in schemaSurfaces", name)
+		typ, ok := goTypeFor(name)
+		if !ok {
+			continue // no single Go type produces it; see unmappedSchemas
+		}
 		goShape := shapeOf(typ)
 		specShape := documentedShape(t, schemas, name)
 		for _, property := range sortedKeys(specShape.canEmit) {
@@ -157,7 +218,10 @@ func TestOpenAPISchemasAdvertiseOnlyEmittedKeys(t *testing.T) {
 func TestOpenAPIRequiredKeysAreAlwaysOnTheWire(t *testing.T) {
 	schemas := loadSchemaDocument(t)
 	for _, name := range sortedSchemaNames(schemas) {
-		typ := schemaSurfaces[name]
+		typ, ok := goTypeFor(name)
+		if !ok {
+			continue // no single Go type produces it; see unmappedSchemas
+		}
 		goShape := shapeOf(typ)
 		specShape := documentedShape(t, schemas, name)
 		for _, property := range sortedKeys(specShape.alwaysPresent) {
@@ -175,17 +239,24 @@ func TestOpenAPIRequiredKeysAreAlwaysOnTheWire(t *testing.T) {
 // adding the property to the schema's required array in api/openapi.yaml and
 // running `make spec`, then dropping it from this list.
 var underReportedRequired = map[string][]string{
-	// "auditor" is the omitempty-on-a-struct case: the tag reads optional and
-	// the key is on every response.
-	"Stats":                     {"auditor", "contract_count", "last_ingested_ledger", "total_events", "verified_through_ledger", "watched_contracts"},
-	"EnrichedEvent":             {"decoded"},
+	// Stats is the omitempty-on-a-struct case throughout: the tags read
+	// optional and every one of these keys is on every response.
+	"Stats": {
+		"auditor", "chain_head_ledger", "contract_count", "events_ingested_total",
+		"ingest_lag_ledgers", "ingester", "last_ingested_ledger", "oldest_stored_ledger",
+		"panics_recovered", "pruner", "query_errors", "rpc_errors", "spec_cache",
+		"table_size_bytes", "total_events", "verified_through_ledger", "watched_contracts",
+	},
 	"CreateSubscriptionRequest": {"filters"},
 }
 
 func TestOpenAPIDoesNotUnderstateAlwaysPresentKeys(t *testing.T) {
 	schemas := loadSchemaDocument(t)
 	for _, name := range sortedSchemaNames(schemas) {
-		typ := schemaSurfaces[name]
+		typ, ok := goTypeFor(name)
+		if !ok {
+			continue // no single Go type produces it; see unmappedSchemas
+		}
 		goShape := shapeOf(typ)
 		specShape := documentedShape(t, schemas, name)
 		want := underReportedRequired[name]
@@ -210,23 +281,16 @@ func TestOpenAPIDoesNotUnderstateAlwaysPresentKeys(t *testing.T) {
 // reason the check below is an equality rather than a subset: a new key on the
 // wire has to either be documented or land here, where it is at least named.
 var undocumentedKeys = map[string][]string{
-	"Event": {"network", "sep41_event"},
-	// EnrichedEvent allOf's Event, so it inherits Event's two gaps on top of
-	// its own decode_error.
-	"EnrichedEvent": {"decode_error", "network", "sep41_event"},
-	"Stats": {
-		"chain_head_ledger", "decode", "events_ingested_total", "ingest_lag_ledgers",
-		"ingester", "last_successful_poll", "oldest_stored_ledger", "panics_recovered",
-		"pruner", "query_errors", "rpc_errors", "spec_cache", "table_size_bytes",
-	},
-	"Subscription":       {"tenant_id"},
-	"SubscriptionFilter": {"network", "topic_contains"},
+	"SubscriptionFilter": {"topic_contains"},
 }
 
 func TestSchemasAccountForEveryEmittedKey(t *testing.T) {
 	schemas := loadSchemaDocument(t)
 	for _, name := range sortedSchemaNames(schemas) {
-		typ := schemaSurfaces[name]
+		typ, ok := goTypeFor(name)
+		if !ok {
+			continue // no single Go type produces it; see unmappedSchemas
+		}
 		goShape := shapeOf(typ)
 		specShape := documentedShape(t, schemas, name)
 
