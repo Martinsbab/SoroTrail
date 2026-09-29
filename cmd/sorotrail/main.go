@@ -660,15 +660,7 @@ func runService(dryRun bool) error {
 	// retention pruner, and pruner. The buffer must hold all of them so
 	// no goroutine parks on a send while shutdown is still draining.
 	errCh := make(chan error, 6)
-	go func() {
-		// The webhook pool joins the shutdown accounting: Run returns
-		// as soon as ctx is cancelled, and this report is what the
-		// drain loop below waits for. It used to be launched without
-		// a report, which left the loop waiting for a component that
-		// never spoke — every graceful shutdown hung until SIGKILL.
-		wh.Run(ctx)
-		errCh <- nil
-	}()
+	go runWebhook(ctx, wh, errCh)
 
 	// Start the ingester only when the advisory lock was acquired (or
 	// when lock enforcement is disabled). The goroutine is skipped
@@ -877,6 +869,18 @@ func ingesterOptionsFromConfig(cfg config.Config, dryRun bool) ingester.Options 
 		Network:                 cfg.Network,
 		DryRun:                  dryRun,
 	}
+}
+
+// runWebhook runs the webhook delivery pool and reports its result to
+// errCh. The pool counts toward shutdown accounting (remaining in run),
+// so the report is not optional: Notifier.Run returns as soon as ctx is
+// cancelled, and the drain loop below waits for exactly one message per
+// component. The webhook used to be launched without a report, which
+// left the drain waiting for a component that never spoke — every
+// graceful shutdown hung until SIGKILL (issue #1002).
+func runWebhook(ctx context.Context, wh *webhook.Notifier, errCh chan<- error) {
+	wh.Run(ctx)
+	errCh <- nil
 }
 
 // bootstrapAdminKey installs MULTI_TENANT_BOOTSTRAP_KEY as a credential for
