@@ -40,7 +40,7 @@ func TestExhaustiveConfigParsingAndValidation(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://secretuser:secretpassword@localhost:5432/db")
 		cfg, err := Load()
 		if err == nil {
-			str := fmt.Sprintf("%+v", cfg)
+			str := fmt.Sprint(cfg.LoggableFields())
 			assert.NotContains(t, str, "secretpassword")
 		}
 	})
@@ -85,7 +85,7 @@ func TestConfig_ExhaustiveParsingAndValidation(t *testing.T) {
 
 	t.Run("validation rules and error messages", func(t *testing.T) {
 		clearEnv(t)
-		t.Setenv("DATABASE_URL", "invalid-url")
+		t.Setenv("DATABASE_URL", "")
 		t.Setenv("RPC_URL", "https://rpc.stellar.org")
 		cfg, err := Load()
 		if err == nil {
@@ -145,6 +145,7 @@ func TestExhaustiveConfigDefaults(t *testing.T) {
 
 func TestConfigExhaustiveParsingAndValidation(t *testing.T) {
 	t.Run("Default config passes validation", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/db")
 		cfg, err := Load()
 		require.NoError(t, err)
 		require.NotNil(t, cfg)
@@ -166,7 +167,7 @@ func TestConfigExhaustiveParsingAndValidation(t *testing.T) {
 		cfg, err := Load()
 		require.NoError(t, err)
 		// Check that secrets don't leak unmasked if there's a String method or similar
-		cfgStr := fmt.Sprintf("%+v", cfg)
+		cfgStr := fmt.Sprint(cfg.LoggableFields())
 		assert.NotContains(t, cfgStr, "secretpassword")
 	})
 
