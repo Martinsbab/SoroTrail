@@ -85,35 +85,53 @@ var SpecRoutes = []SpecRoute{
 	{Method: "DELETE", Path: "/watched-contracts/{id}"},
 }
 
+// APIKey API key metadata. The secret half of the key is never included — only a bcrypt hash of it is stored, and the plaintext is returned exactly once, by POST /apikeys.
 type APIKey struct {
 	CreatedAt string `json:"created_at"`
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	Prefix    string `json:"prefix"`
+	// ID Database ID, used to revoke the key.
+	ID int64 `json:"id"`
+	// Name Human-readable label, empty for an unnamed key.
+	Name string `json:"name"`
+	// Prefix The non-secret 16-character lookup handle stored in the clear. It identifies the key without revealing it.
+	Prefix string `json:"prefix"`
+	// RevokedAt When the key was revoked. Absent while the key is active.
 	RevokedAt string `json:"revoked_at,omitempty"`
 }
 
+// ContractSummary API schema used by the SoroTrail client.
 type ContractSummary struct {
-	ContractID  string `json:"contract_id"`
-	EventCount  int64  `json:"event_count"`
-	FirstLedger int64  `json:"first_ledger"`
-	LastLedger  int64  `json:"last_ledger"`
-	LastSeen    string `json:"last_seen"`
+	ContractID string `json:"contract_id"`
+	// EventCount Total stored events for this contract
+	EventCount int64 `json:"event_count"`
+	// FirstLedger Oldest ledger with a stored event for this contract
+	FirstLedger int64 `json:"first_ledger"`
+	// LastLedger Newest ledger with a stored event for this contract
+	LastLedger int64 `json:"last_ledger"`
+	// LastSeen Wall-clock time the most recent event was ingested
+	LastSeen string `json:"last_seen"`
 }
 
+// ContractsPage API schema used by the SoroTrail client.
 type ContractsPage struct {
 	Contracts []ContractSummary `json:"contracts"`
-	Count     int64             `json:"count"`
-	Cursor    string            `json:"cursor,omitempty"`
+	// Count Number of contracts on this page
+	Count int64 `json:"count"`
+	// Cursor Present when more results exist; pass back as ?cursor=
+	Cursor string `json:"cursor,omitempty"`
 }
 
+// CreateSubscriptionRequest API schema used by the SoroTrail client.
 type CreateSubscriptionRequest struct {
+	// Enabled Defaults to true
 	Enabled bool               `json:"enabled,omitempty"`
 	Filters SubscriptionFilter `json:"filters,omitempty"`
-	Secret  string             `json:"secret"`
-	Url     string             `json:"url"`
+	// Secret HMAC-SHA256 secret for payload verification
+	Secret string `json:"secret"`
+	// Url Callback URL
+	Url string `json:"url"`
 }
 
+// DeliveryAttempt API schema used by the SoroTrail client.
 type DeliveryAttempt struct {
 	CreatedAt      string `json:"created_at"`
 	DurationMs     int64  `json:"duration_ms"`
@@ -125,36 +143,54 @@ type DeliveryAttempt struct {
 	SubscriptionID int64  `json:"subscription_id"`
 }
 
+// EnrichedEvent API schema used by the SoroTrail client.
 type EnrichedEvent map[string]any
 
+// ErrorResponse Standard error envelope
 type ErrorResponse struct {
+	// Error Human-readable error message
 	Error string `json:"error"`
 }
 
+// Event A Stellar/Soroban contract event
 type Event struct {
-	ContractID       string `json:"contract_id"`
-	CreatedAt        string `json:"created_at"`
-	ID               string `json:"id"`
-	InSuccessfulCall bool   `json:"in_successful_call"`
-	Ledger           int64  `json:"ledger"`
-	OpIndex          int64  `json:"op_index"`
-	Topics           []any  `json:"topics"`
-	TxHash           string `json:"tx_hash"`
-	TxIndex          int64  `json:"tx_index"`
-	Type             string `json:"type"`
-	Value            any    `json:"value"`
+	// ContractID Contract ID
+	ContractID string `json:"contract_id"`
+	// CreatedAt When the event was persisted
+	CreatedAt string `json:"created_at"`
+	// ID TOID-based event identifier
+	ID string `json:"id"`
+	// InSuccessfulCall Whether the event was emitted in a successful call
+	InSuccessfulCall bool `json:"in_successful_call"`
+	// Ledger Ledger sequence number
+	Ledger int64 `json:"ledger"`
+	// OpIndex Operation index within the transaction
+	OpIndex int64 `json:"op_index"`
+	// Topics Event topic values (JSON-encoded)
+	Topics []any `json:"topics"`
+	// TxHash Transaction hash
+	TxHash string `json:"tx_hash"`
+	// TxIndex Transaction index within the ledger
+	TxIndex int64  `json:"tx_index"`
+	Type    string `json:"type"`
+	// Value Event value (JSON-encoded)
+	Value any `json:"value"`
 }
 
+// EventsResponse API schema used by the SoroTrail client.
 type EventsResponse struct {
+	// Cursor Present when more results exist; pass back as ?cursor=
 	Cursor string  `json:"cursor,omitempty"`
 	Events []Event `json:"events"`
 }
 
+// HealthResponse API schema used by the SoroTrail client.
 type HealthResponse struct {
 	Checks map[string]any `json:"checks"`
 	Status string         `json:"status"`
 }
 
+// Stats API schema used by the SoroTrail client.
 type Stats struct {
 	Auditor *struct {
 		FindingsOpened        int64 `json:"findings_opened,omitempty"`
@@ -172,6 +208,7 @@ type Stats struct {
 	WatchedContracts      int64 `json:"watched_contracts,omitempty"`
 }
 
+// Subscription API schema used by the SoroTrail client.
 type Subscription struct {
 	CreatedAt    string             `json:"created_at"`
 	Enabled      bool               `json:"enabled"`
@@ -182,14 +219,17 @@ type Subscription struct {
 	Url          string             `json:"url"`
 }
 
+// SubscriptionFilter Filter that callbacks use to select which events to deliver. An empty filter matches every event.
 type SubscriptionFilter struct {
 	ContractID string `json:"contract_id,omitempty"`
 	FromLedger int64  `json:"from_ledger,omitempty"`
 	ToLedger   int64  `json:"to_ledger,omitempty"`
-	Topic      any    `json:"topic,omitempty"`
-	Type       string `json:"type,omitempty"`
+	// Topic Exact JSON match against any topic position
+	Topic any    `json:"topic,omitempty"`
+	Type  string `json:"type,omitempty"`
 }
 
+// UpdateSubscriptionRequest API schema used by the SoroTrail client.
 type UpdateSubscriptionRequest struct {
 	Enabled bool               `json:"enabled,omitempty"`
 	Filters SubscriptionFilter `json:"filters,omitempty"`
@@ -197,12 +237,16 @@ type UpdateSubscriptionRequest struct {
 	Url     string             `json:"url,omitempty"`
 }
 
+// AddTenantWatchResponse API schema used by the SoroTrail client.
 type AddTenantWatchResponse map[string]any
 
+// AddWatchedContractResponse API schema used by the SoroTrail client.
 type AddWatchedContractResponse map[string]any
 
+// AddressSummaryResponse API schema used by the SoroTrail client.
 type AddressSummaryResponse map[string]any
 
+// AggregateEventsResponse API schema used by the SoroTrail client.
 type AggregateEventsResponse struct {
 	Buckets []struct {
 		Count int64  `json:"count,omitempty"`
@@ -210,98 +254,142 @@ type AggregateEventsResponse struct {
 	} `json:"buckets,omitempty"`
 }
 
+// ContractStatsResponse API schema used by the SoroTrail client.
 type ContractStatsResponse struct {
-	ContractID    string `json:"contract_id"`
-	Decimals      int64  `json:"decimals,omitempty"`
-	EventCount    int64  `json:"event_count"`
-	Name          string `json:"name,omitempty"`
-	Symbol        string `json:"symbol,omitempty"`
+	// ContractID Stellar contract ID (C-prefixed)
+	ContractID string `json:"contract_id"`
+	// Decimals Token decimals, when cached metadata is available
+	Decimals int64 `json:"decimals,omitempty"`
+	// EventCount Number of stored events for this contract
+	EventCount int64 `json:"event_count"`
+	// Name Token name, when cached metadata is available
+	Name string `json:"name,omitempty"`
+	// Symbol Token symbol, when cached metadata is available
+	Symbol string `json:"symbol,omitempty"`
+	// TypeBreakdown Per-type event counts for this contract. Omitted when the breakdown is unavailable.
 	TypeBreakdown []struct {
-		Count int64  `json:"count"`
-		Type  string `json:"type"`
+		// Count Number of events of this type
+		Count int64 `json:"count"`
+		// Type Event type, e.g. contract or diagnostic
+		Type string `json:"type"`
 	} `json:"type_breakdown,omitempty"`
 }
 
+// CountEventsResponse API schema used by the SoroTrail client.
 type CountEventsResponse struct {
 	Count int64 `json:"count,omitempty"`
 }
 
+// CreateAPIKeyRequest API schema used by the SoroTrail client.
 type CreateAPIKeyRequest struct {
+	// Name A human-readable label for the key, to make it identifiable in the list response. At most 100 characters.
 	Name string `json:"name,omitempty"`
 }
 
+// CreateAPIKeyResponse API schema used by the SoroTrail client.
 type CreateAPIKeyResponse map[string]any
 
+// CreateTenantKeyResponse API schema used by the SoroTrail client.
 type CreateTenantKeyResponse map[string]any
 
+// CreateTenantResponse API schema used by the SoroTrail client.
 type CreateTenantResponse map[string]any
 
+// CurrentTenantResponse API schema used by the SoroTrail client.
 type CurrentTenantResponse map[string]any
 
+// CurrentTenantUsageResponse API schema used by the SoroTrail client.
 type CurrentTenantUsageResponse map[string]any
 
+// DeleteContractSpecOverrideResponse API schema used by the SoroTrail client.
 type DeleteContractSpecOverrideResponse struct {
 	ContractID string `json:"contract_id"`
 	Deleted    bool   `json:"deleted"`
 }
 
+// DeleteEventsResponse API schema used by the SoroTrail client.
 type DeleteEventsResponse struct {
 	Deleted int64 `json:"deleted,omitempty"`
 }
 
+// GetContractResponse API schema used by the SoroTrail client.
 type GetContractResponse struct {
-	ContractID  string `json:"contract_id"`
-	EventCount  int64  `json:"event_count"`
-	FirstLedger int64  `json:"first_ledger"`
-	LastLedger  int64  `json:"last_ledger"`
-	LastSeen    string `json:"last_seen"`
+	// ContractID Stellar contract ID (C-prefixed)
+	ContractID string `json:"contract_id"`
+	// EventCount Number of stored events for this contract
+	EventCount int64 `json:"event_count"`
+	// FirstLedger Earliest ledger holding an event for this contract
+	FirstLedger int64 `json:"first_ledger"`
+	// LastLedger Most recent ledger holding an event for this contract
+	LastLedger int64 `json:"last_ledger"`
+	// LastSeen Timestamp of the most recent event
+	LastSeen string `json:"last_seen"`
 }
 
+// GetContractSpecOverrideResponse API schema used by the SoroTrail client.
 type GetContractSpecOverrideResponse struct {
 	ContractID string         `json:"contract_id"`
 	Spec       map[string]any `json:"spec"`
 }
 
+// GetEventResponse API schema used by the SoroTrail client.
 type GetEventResponse = Event
 
+// GetTenantResponse API schema used by the SoroTrail client.
 type GetTenantResponse map[string]any
 
+// GrantContractResponse API schema used by the SoroTrail client.
 type GrantContractResponse map[string]any
 
+// ListDeadLettersResponse API schema used by the SoroTrail client.
 type ListDeadLettersResponse map[string]any
 
+// ListTenantGrantsResponse API schema used by the SoroTrail client.
 type ListTenantGrantsResponse map[string]any
 
+// ListTenantKeysResponse API schema used by the SoroTrail client.
 type ListTenantKeysResponse map[string]any
 
+// ListTenantsResponse API schema used by the SoroTrail client.
 type ListTenantsResponse map[string]any
 
+// ListWatchedContractsResponse API schema used by the SoroTrail client.
 type ListWatchedContractsResponse map[string]any
 
+// PutContractSpecOverrideRequest API schema used by the SoroTrail client.
 type PutContractSpecOverrideRequest map[string]any
 
+// PutContractSpecOverrideResponse API schema used by the SoroTrail client.
 type PutContractSpecOverrideResponse struct {
 	ContractID string         `json:"contract_id"`
 	Spec       map[string]any `json:"spec"`
 }
 
+// RawEventResponse API schema used by the SoroTrail client.
 type RawEventResponse struct {
 	TopicsXdr []string `json:"topics_xdr,omitempty"`
 	ValueXdr  string   `json:"value_xdr,omitempty"`
 }
 
+// RemoveTenantWatchResponse API schema used by the SoroTrail client.
 type RemoveTenantWatchResponse map[string]any
 
+// RemoveWatchedContractResponse API schema used by the SoroTrail client.
 type RemoveWatchedContractResponse map[string]any
 
+// RevokeContractResponse API schema used by the SoroTrail client.
 type RevokeContractResponse map[string]any
 
+// TenantUsageResponse API schema used by the SoroTrail client.
 type TenantUsageResponse map[string]any
 
+// TenantWatchListResponse API schema used by the SoroTrail client.
 type TenantWatchListResponse map[string]any
 
+// UpdateTenantResponse API schema used by the SoroTrail client.
 type UpdateTenantResponse map[string]any
 
+// VersionResponse API schema used by the SoroTrail client.
 type VersionResponse struct {
 	BuildDate string `json:"build_date,omitempty"`
 	Commit    string `json:"commit,omitempty"`
