@@ -86,18 +86,26 @@ var SpecRoutes = []SpecRoute{
 	{Method: "DELETE", Path: "/watched-contracts/{id}"},
 }
 
+// APIKey API key metadata. The secret half of the key is never included — only a bcrypt hash of it is stored, and the plaintext is returned exactly once, by POST /apikeys.
 type APIKey struct {
 	CreatedAt string `json:"created_at"`
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	Prefix    string `json:"prefix"`
+	// ID Database ID, used to revoke the key.
+	ID int64 `json:"id"`
+	// Name Human-readable label, empty for an unnamed key.
+	Name string `json:"name"`
+	// Prefix The non-secret 16-character hexadecimal lookup handle stored in the clear. It identifies the key without revealing it.
+	Prefix string `json:"prefix"`
+	// RevokedAt When the key was revoked. Absent while the key is active.
 	RevokedAt string `json:"revoked_at,omitempty"`
 }
 
+// APIKeyRequest Optional body for creating an API key.
 type APIKeyRequest struct {
+	// Name Human-readable label for the key.
 	Name string `json:"name,omitempty"`
 }
 
+// AddressSummary Aggregate activity for one Stellar address.
 type AddressSummary struct {
 	Address           string   `json:"address"`
 	DistinctContracts []string `json:"distinct_contracts"`
@@ -106,53 +114,76 @@ type AddressSummary struct {
 	LastSeenLedger    int64    `json:"last_seen_ledger"`
 }
 
+// AggregateBucket API schema used by the SoroTrail client.
 type AggregateBucket struct {
+	// Bucket Ledger number or time-bucket key.
 	Bucket string `json:"bucket"`
 	Count  int64  `json:"count"`
 }
 
+// AggregateResponse API schema used by the SoroTrail client.
 type AggregateResponse struct {
 	Buckets []AggregateBucket `json:"buckets"`
 }
 
+// ContractListEnvelope Alternate contract-list page returned when envelope=true.
 type ContractListEnvelope struct {
 	Data       []ContractSummary `json:"data"`
 	NextCursor string            `json:"next_cursor,omitempty"`
 }
 
+// ContractListResponse Default contract page or alternate envelope page.
 type ContractListResponse = ContractsPage
 
+// ContractSpecOverrideRequest Wrapper containing a SEP-0041 contract specification JSON. Send the specification under the spec property.
 type ContractSpecOverrideRequest struct {
+	// Spec SEP-0041 contract specification JSON.
 	Spec map[string]any `json:"spec"`
 }
 
+// ContractSummary API schema used by the SoroTrail client.
 type ContractSummary struct {
-	ContractID  string `json:"contract_id"`
-	EventCount  int64  `json:"event_count"`
-	FirstLedger int64  `json:"first_ledger"`
-	LastLedger  int64  `json:"last_ledger"`
-	LastSeen    string `json:"last_seen"`
+	ContractID string `json:"contract_id"`
+	// EventCount Total stored events for this contract
+	EventCount int64 `json:"event_count"`
+	// FirstLedger Oldest ledger with a stored event for this contract
+	FirstLedger int64 `json:"first_ledger"`
+	// LastLedger Newest ledger with a stored event for this contract
+	LastLedger int64 `json:"last_ledger"`
+	// LastSeen Wall-clock time the most recent event was ingested
+	LastSeen string `json:"last_seen"`
 }
 
+// ContractsPage API schema used by the SoroTrail client.
 type ContractsPage struct {
 	Contracts []ContractSummary `json:"contracts"`
-	Count     int64             `json:"count"`
-	Cursor    string            `json:"cursor,omitempty"`
+	// Count Number of contracts on this page
+	Count int64 `json:"count"`
+	// Cursor Present when more results exist; pass back as ?cursor=
+	Cursor string `json:"cursor,omitempty"`
 }
 
+// CreateSubscriptionRequest API schema used by the SoroTrail client.
 type CreateSubscriptionRequest struct {
+	// Enabled Defaults to true
 	Enabled bool               `json:"enabled,omitempty"`
 	Filters SubscriptionFilter `json:"filters,omitempty"`
-	Secret  string             `json:"secret"`
-	Url     string             `json:"url"`
+	// Secret HMAC-SHA256 secret for payload verification
+	Secret string `json:"secret"`
+	// Url Callback URL
+	Url string `json:"url"`
 }
 
+// CurrentTenant The authenticated tenant and its effective read scope.
 type CurrentTenant struct {
+	// GrantedContractIds Contract IDs granted to a non-wildcard tenant.
 	GrantedContractIds []string `json:"granted_contract_ids,omitempty"`
 	Tenant             Tenant   `json:"tenant"`
-	Wildcard           bool     `json:"wildcard"`
+	// Wildcard Whether the caller has unrestricted contract visibility.
+	Wildcard bool `json:"wildcard"`
 }
 
+// DeadLetter An event that could not be decoded or persisted.
 type DeadLetter struct {
 	Attempts    int64    `json:"attempts"`
 	ContractID  string   `json:"contract_id"`
@@ -168,17 +199,20 @@ type DeadLetter struct {
 	ValueXdr    string   `json:"value_xdr,omitempty"`
 }
 
+// DeadLettersEnvelope API schema used by the SoroTrail client.
 type DeadLettersEnvelope struct {
 	Data       []DeadLetter `json:"data"`
 	NextCursor string       `json:"next_cursor,omitempty"`
 }
 
+// DeadLettersPage API schema used by the SoroTrail client.
 type DeadLettersPage struct {
 	Count       int64        `json:"count"`
 	Cursor      string       `json:"cursor,omitempty"`
 	DeadLetters []DeadLetter `json:"dead_letters"`
 }
 
+// DeliveryAttempt API schema used by the SoroTrail client.
 type DeliveryAttempt struct {
 	CreatedAt      string `json:"created_at"`
 	DurationMs     int64  `json:"duration_ms"`
@@ -190,67 +224,97 @@ type DeliveryAttempt struct {
 	SubscriptionID int64  `json:"subscription_id"`
 }
 
+// DeliveryEnvelopeResponse Alternate delivery-attempt page returned when envelope=true.
 type DeliveryEnvelopeResponse struct {
 	Data       []DeliveryAttempt `json:"data"`
 	NextCursor string            `json:"next_cursor,omitempty"`
 }
 
+// EnrichedEvent API schema used by the SoroTrail client.
 type EnrichedEvent map[string]any
 
+// ErrorResponse Standard error envelope
 type ErrorResponse struct {
+	// Error Human-readable error message
 	Error string `json:"error"`
 }
 
+// Event A Stellar/Soroban contract event
 type Event struct {
-	ContractID       string `json:"contract_id"`
-	CreatedAt        string `json:"created_at"`
-	ID               string `json:"id"`
-	InSuccessfulCall bool   `json:"in_successful_call"`
-	Ledger           int64  `json:"ledger"`
-	Network          string `json:"network"`
-	OpIndex          int64  `json:"op_index"`
-	Sep41Event       any    `json:"sep41_event,omitempty"`
-	Topics           []any  `json:"topics"`
-	TxHash           string `json:"tx_hash"`
-	TxIndex          int64  `json:"tx_index"`
-	Type             string `json:"type"`
-	Value            any    `json:"value"`
+	// ContractID Contract ID
+	ContractID string `json:"contract_id"`
+	// CreatedAt When the event was persisted
+	CreatedAt string `json:"created_at"`
+	// ID TOID-based event identifier
+	ID string `json:"id"`
+	// InSuccessfulCall Whether the event was emitted in a successful call
+	InSuccessfulCall bool `json:"in_successful_call"`
+	// Ledger Ledger sequence number
+	Ledger int64 `json:"ledger"`
+	// Network Stellar network on which the event was observed.
+	Network string `json:"network"`
+	// OpIndex Operation index within the transaction
+	OpIndex int64 `json:"op_index"`
+	// Sep41Event Optional additive SEP-41 normalized event envelope. Omitted for events that do not match a SEP-41 event shape.
+	Sep41Event any `json:"sep41_event,omitempty"`
+	// Topics Event topic values; each item is arbitrary JSON.
+	Topics []any `json:"topics"`
+	// TxHash Transaction hash
+	TxHash string `json:"tx_hash"`
+	// TxIndex Transaction index within the ledger
+	TxIndex int64  `json:"tx_index"`
+	Type    string `json:"type"`
+	// Value Event value as arbitrary JSON.
+	Value any `json:"value"`
 }
 
+// EventEnvelopeResponse Alternate list shape returned when envelope=true.
 type EventEnvelopeResponse struct {
-	Data       []any  `json:"data"`
+	Data []any `json:"data"`
+	// NextCursor Cursor for the next page, omitted at the end.
 	NextCursor string `json:"next_cursor,omitempty"`
 }
 
+// EventListResponse Default event page or the alternate envelope page.
 type EventListResponse = EventsResponse
 
+// EventResponse A single decoded, enriched, projected or XDR event.
 type EventResponse map[string]any
 
+// EventWithXDR XDR-only projection returned by include_xdr=true. The projection contains the stored raw topic/value fields rather than the decoded event columns.
 type EventWithXDR struct {
 	TopicsXdr json.RawMessage `json:"topics_xdr"`
 	ValueXdr  json.RawMessage `json:"value_xdr,omitempty"`
 }
 
+// EventsResponse A page of decoded, enriched, projected or XDR events.
 type EventsResponse struct {
+	// Cursor Present when more results exist; pass back as ?cursor=
 	Cursor string  `json:"cursor,omitempty"`
 	Events []Event `json:"events"`
 }
 
+// GrantContractRequest JSON body used to grant one contract to a tenant.
 type GrantContractRequest struct {
+	// ContractID Stellar contract ID to grant to the tenant.
 	ContractID string `json:"contract_id"`
 }
 
+// GrantList Contract IDs currently readable by a tenant.
 type GrantList struct {
 	ContractIds []string `json:"contract_ids"`
 }
 
+// HealthResponse API schema used by the SoroTrail client.
 type HealthResponse struct {
 	Checks map[string]any `json:"checks"`
 	Status string         `json:"status"`
 }
 
+// ProjectedEvent Event object containing only fields selected by fields=.
 type ProjectedEvent map[string]any
 
+// Stats Ingestion, audit, RPC, cache and decoder counters.
 type Stats struct {
 	Auditor             json.RawMessage `json:"auditor,omitempty"`
 	ChainHeadLedger     json.RawMessage `json:"chain_head_ledger,omitempty"`
@@ -290,6 +354,7 @@ type Stats struct {
 	WatchedContracts      int64 `json:"watched_contracts,omitempty"`
 }
 
+// Subscription API schema used by the SoroTrail client.
 type Subscription struct {
 	CreatedAt    string             `json:"created_at"`
 	Enabled      bool               `json:"enabled"`
@@ -297,23 +362,29 @@ type Subscription struct {
 	Filters      SubscriptionFilter `json:"filters"`
 	ID           int64              `json:"id"`
 	Secret       string             `json:"secret"`
-	TenantID     int64              `json:"tenant_id,omitempty"`
-	Url          string             `json:"url"`
+	// TenantID Owning tenant; omitted for operator-owned subscriptions.
+	TenantID int64  `json:"tenant_id,omitempty"`
+	Url      string `json:"url"`
 }
 
+// SubscriptionFilter Filter that callbacks use to select which events to deliver. An empty filter matches every event.
 type SubscriptionFilter struct {
 	ContractID string `json:"contract_id,omitempty"`
 	FromLedger int64  `json:"from_ledger,omitempty"`
-	Network    string `json:"network,omitempty"`
-	ToLedger   int64  `json:"to_ledger,omitempty"`
-	Topic      any    `json:"topic,omitempty"`
-	Type       string `json:"type,omitempty"`
+	// Network Restrict delivery to one Stellar network.
+	Network  string `json:"network,omitempty"`
+	ToLedger int64  `json:"to_ledger,omitempty"`
+	// Topic Exact JSON match against any topic position
+	Topic any    `json:"topic,omitempty"`
+	Type  string `json:"type,omitempty"`
 }
 
+// Tenant Tenant identity, access scope and quota configuration.
 type Tenant struct {
-	Admin               bool            `json:"admin"`
-	CreatedAt           string          `json:"created_at"`
-	Enabled             bool            `json:"enabled"`
+	Admin     bool   `json:"admin"`
+	CreatedAt string `json:"created_at"`
+	Enabled   bool   `json:"enabled"`
+	// ID Tenant database ID.
 	ID                  int64           `json:"id"`
 	MaxWatchedContracts json.RawMessage `json:"max_watched_contracts,omitempty"`
 	Name                string          `json:"name"`
@@ -322,6 +393,7 @@ type Tenant struct {
 	Wildcard            bool            `json:"wildcard"`
 }
 
+// TenantAPIKey Tenant API key metadata; secret is returned only on creation.
 type TenantAPIKey struct {
 	CreatedAt  string `json:"created_at"`
 	ID         int64  `json:"id"`
@@ -329,42 +401,64 @@ type TenantAPIKey struct {
 	Name       string `json:"name"`
 	Prefix     string `json:"prefix"`
 	RevokedAt  string `json:"revoked_at,omitempty"`
-	Secret     string `json:"secret,omitempty"`
-	TenantID   int64  `json:"tenant_id"`
+	// Secret Plaintext tenant key, returned only by the create endpoint.
+	Secret   string `json:"secret,omitempty"`
+	TenantID int64  `json:"tenant_id"`
 }
 
+// TenantAPIKeyRequest JSON body used to issue an API key for a tenant.
 type TenantAPIKeyRequest struct {
+	// Name Human-readable label for the generated key.
 	Name string `json:"name,omitempty"`
 }
 
+// TenantAPIKeysPage API schema used by the SoroTrail client.
 type TenantAPIKeysPage struct {
 	Keys []TenantAPIKey `json:"keys"`
 }
 
+// TenantCreateRequest JSON body used to create a tenant.
 type TenantCreateRequest struct {
-	Admin               bool    `json:"admin,omitempty"`
-	Enabled             bool    `json:"enabled,omitempty"`
-	MaxWatchedContracts int64   `json:"max_watched_contracts,omitempty"`
-	Name                string  `json:"name"`
-	RateLimitBurst      int64   `json:"rate_limit_burst,omitempty"`
-	RateLimitRps        float64 `json:"rate_limit_rps,omitempty"`
-	Wildcard            bool    `json:"wildcard,omitempty"`
+	// Admin When true, the tenant may use the administrative API.
+	Admin bool `json:"admin,omitempty"`
+	// Enabled Whether the tenant is enabled for requests.
+	Enabled bool `json:"enabled,omitempty"`
+	// MaxWatchedContracts Maximum number of contracts this tenant may watch.
+	MaxWatchedContracts int64 `json:"max_watched_contracts,omitempty"`
+	// Name Unique human-readable tenant name.
+	Name string `json:"name"`
+	// RateLimitBurst Optional burst-size override. Set together with rate_limit_rps.
+	RateLimitBurst int64 `json:"rate_limit_burst,omitempty"`
+	// RateLimitRps Optional requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
+	RateLimitRps float64 `json:"rate_limit_rps,omitempty"`
+	// Wildcard When true, the tenant can read events for every contract.
+	Wildcard bool `json:"wildcard,omitempty"`
 }
 
+// TenantList All tenants visible to the administrative caller.
 type TenantList struct {
 	Tenants []Tenant `json:"tenants"`
 }
 
+// TenantUpdateRequest JSON body for a partial tenant update. Every property is optional; omitted properties retain their current value.
 type TenantUpdateRequest struct {
-	Admin               bool    `json:"admin,omitempty"`
-	Enabled             bool    `json:"enabled,omitempty"`
-	MaxWatchedContracts int64   `json:"max_watched_contracts,omitempty"`
-	Name                string  `json:"name,omitempty"`
-	RateLimitBurst      int64   `json:"rate_limit_burst,omitempty"`
-	RateLimitRps        float64 `json:"rate_limit_rps,omitempty"`
-	Wildcard            bool    `json:"wildcard,omitempty"`
+	// Admin When true, the tenant may use the administrative API.
+	Admin bool `json:"admin,omitempty"`
+	// Enabled Whether the tenant is enabled for requests.
+	Enabled bool `json:"enabled,omitempty"`
+	// MaxWatchedContracts Maximum number of contracts this tenant may watch.
+	MaxWatchedContracts int64 `json:"max_watched_contracts,omitempty"`
+	// Name Replacement tenant name.
+	Name string `json:"name,omitempty"`
+	// RateLimitBurst Burst-size override. Set together with rate_limit_rps.
+	RateLimitBurst int64 `json:"rate_limit_burst,omitempty"`
+	// RateLimitRps Requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
+	RateLimitRps float64 `json:"rate_limit_rps,omitempty"`
+	// Wildcard When true, the tenant can read events for every contract.
+	Wildcard bool `json:"wildcard,omitempty"`
 }
 
+// TenantUsage One UTC day of tenant usage counters.
 type TenantUsage struct {
 	Day           string `json:"day"`
 	EventsServed  int64  `json:"events_served"`
@@ -373,10 +467,12 @@ type TenantUsage struct {
 	TenantID      int64  `json:"tenant_id"`
 }
 
+// TenantWatchList Contract IDs currently watched by the calling tenant.
 type TenantWatchList struct {
 	ContractIds []string `json:"contract_ids"`
 }
 
+// UpdateSubscriptionRequest API schema used by the SoroTrail client.
 type UpdateSubscriptionRequest struct {
 	Enabled bool               `json:"enabled,omitempty"`
 	Filters SubscriptionFilter `json:"filters,omitempty"`
@@ -384,15 +480,19 @@ type UpdateSubscriptionRequest struct {
 	Url     string             `json:"url,omitempty"`
 }
 
+// UsagePage API schema used by the SoroTrail client.
 type UsagePage struct {
 	Usage []TenantUsage `json:"usage"`
 }
 
+// WatchedContract One contract in the global ingestion watch list.
 type WatchedContract struct {
+	// AddedAt When the contract was added to the watch list.
 	AddedAt    string `json:"added_at"`
 	ContractID string `json:"contract_id"`
 }
 
+// WatchedContractAdded Result of adding a contract to the global watch list.
 type WatchedContractAdded struct {
 	AddedAt           string `json:"added_at"`
 	ContractID        string `json:"contract_id"`
@@ -400,6 +500,7 @@ type WatchedContractAdded struct {
 	ModeTransition    string `json:"mode_transition,omitempty"`
 }
 
+// WatchedContractRemoved Result of removing a contract from the global watch list.
 type WatchedContractRemoved struct {
 	ContractID       string `json:"contract_id"`
 	HistoryPreserved bool   `json:"history_preserved"`
@@ -407,69 +508,97 @@ type WatchedContractRemoved struct {
 	RemovedAt        string `json:"removed_at"`
 }
 
+// WatchedContractRequest JSON body used to add a contract to a watch list.
 type WatchedContractRequest struct {
+	// ContractID Stellar contract ID to add to the watch list.
 	ContractID string `json:"contract_id"`
 }
 
+// WatchedContractsPage The complete global contract watch list.
 type WatchedContractsPage struct {
 	Contracts []WatchedContract `json:"contracts"`
 	Count     int64             `json:"count"`
 }
 
+// ContractStatsResponse API schema used by the SoroTrail client.
 type ContractStatsResponse struct {
-	ContractID    string `json:"contract_id"`
-	Decimals      int64  `json:"decimals,omitempty"`
-	EventCount    int64  `json:"event_count"`
-	Name          string `json:"name,omitempty"`
-	Symbol        string `json:"symbol,omitempty"`
+	// ContractID Stellar contract ID (C-prefixed)
+	ContractID string `json:"contract_id"`
+	// Decimals Token decimals, when cached metadata is available
+	Decimals int64 `json:"decimals,omitempty"`
+	// EventCount Number of stored events for this contract
+	EventCount int64 `json:"event_count"`
+	// Name Token name, when cached metadata is available
+	Name string `json:"name,omitempty"`
+	// Symbol Token symbol, when cached metadata is available
+	Symbol string `json:"symbol,omitempty"`
+	// TypeBreakdown Per-type event counts for this contract. Omitted when the breakdown is unavailable.
 	TypeBreakdown []struct {
-		Count int64  `json:"count"`
-		Type  string `json:"type"`
+		// Count Number of events of this type
+		Count int64 `json:"count"`
+		// Type Event type, e.g. contract or diagnostic
+		Type string `json:"type"`
 	} `json:"type_breakdown,omitempty"`
 }
 
+// CountEventsResponse API schema used by the SoroTrail client.
 type CountEventsResponse struct {
 	Count int64 `json:"count,omitempty"`
 }
 
+// CreateAPIKeyResponse API schema used by the SoroTrail client.
 type CreateAPIKeyResponse map[string]any
 
+// DeleteContractSpecOverrideResponse API schema used by the SoroTrail client.
 type DeleteContractSpecOverrideResponse struct {
 	ContractID string `json:"contract_id"`
 	Deleted    bool   `json:"deleted"`
 }
 
+// DeleteEventsResponse API schema used by the SoroTrail client.
 type DeleteEventsResponse struct {
 	Deleted int64 `json:"deleted,omitempty"`
 }
 
+// GetContractResponse API schema used by the SoroTrail client.
 type GetContractResponse struct {
-	ContractID  string `json:"contract_id"`
-	EventCount  int64  `json:"event_count"`
-	FirstLedger int64  `json:"first_ledger"`
-	LastLedger  int64  `json:"last_ledger"`
-	LastSeen    string `json:"last_seen"`
+	// ContractID Stellar contract ID (C-prefixed)
+	ContractID string `json:"contract_id"`
+	// EventCount Number of stored events for this contract
+	EventCount int64 `json:"event_count"`
+	// FirstLedger Earliest ledger holding an event for this contract
+	FirstLedger int64 `json:"first_ledger"`
+	// LastLedger Most recent ledger holding an event for this contract
+	LastLedger int64 `json:"last_ledger"`
+	// LastSeen Timestamp of the most recent event
+	LastSeen string `json:"last_seen"`
 }
 
+// GetContractSpecOverrideResponse API schema used by the SoroTrail client.
 type GetContractSpecOverrideResponse struct {
 	ContractID string         `json:"contract_id"`
 	Spec       map[string]any `json:"spec"`
 }
 
+// ListDeadLettersResponse API schema used by the SoroTrail client.
 type ListDeadLettersResponse = DeadLettersPage
 
+// ListDeliveriesResponse API schema used by the SoroTrail client.
 type ListDeliveriesResponse = DeliveryEnvelopeResponse
 
+// PutContractSpecOverrideResponse API schema used by the SoroTrail client.
 type PutContractSpecOverrideResponse struct {
 	ContractID string         `json:"contract_id"`
 	Spec       map[string]any `json:"spec"`
 }
 
+// RawEventResponse API schema used by the SoroTrail client.
 type RawEventResponse struct {
 	TopicsXdr []string `json:"topics_xdr,omitempty"`
 	ValueXdr  string   `json:"value_xdr,omitempty"`
 }
 
+// VersionResponse API schema used by the SoroTrail client.
 type VersionResponse struct {
 	BuildDate string `json:"build_date,omitempty"`
 	Commit    string `json:"commit,omitempty"`
