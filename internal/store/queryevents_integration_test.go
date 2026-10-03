@@ -265,8 +265,8 @@ func TestQueryEvents_FilterCombinations(t *testing.T) {
 
 	// Seed once with duplicate sort values so the ordering-totalness checks
 	// are meaningful: three events per ledger, shared created_at per ledger.
-	seedOrderingEvents(t, st)
-	n := len(seededOrderingEvents(t, st))
+	seededOrder := seedOrderingEvents(t, st)
+	n := len(seededOrder)
 
 	t.Run("pagination direction and order_by", func(t *testing.T) {
 		for _, orderBy := range []string{"", OrderByID, OrderByLedger, OrderByCreatedAt} {
@@ -297,24 +297,36 @@ func TestQueryEvents_FilterCombinations(t *testing.T) {
 	})
 
 	t.Run("cursor validity across orderings", func(t *testing.T) {
-		_, idCursor, err := st.QueryEvents(ctx, EventFilter{Limit: 2, Scope: WildcardScope()})
-		require.NoError(t, err)
-		require.NotEmpty(t, idCursor)
+		// Seed once so cursor assertions are bound to the actual fixture,
+		// not to a hand-written ID constant.
+		seeded := seedOrderingEvents(t, st)
 
+		// A bare id cursor from the first page must resume at the third
+		// seeded event when followed.
 		t.Run("bare id cursor resumes after the first page", func(t *testing.T) {
 			page, cursor, err := st.QueryEvents(ctx, EventFilter{Limit: 2, Scope: WildcardScope()})
 			require.NoError(t, err)
 			require.Len(t, page, 2)
-			require.NotEmpty(t, cursor)				next, _, err := st.QueryEvents(ctx, EventFilter{Limit: 2, Cursor: cursor, Scope: WildcardScope()})
-				require.NoError(t, err)
-				require.Len(t, next, 10)
-				// Ledger 100 holds three events (IDs 1, 2, 3) with the same
-				// created_at; after the first page consumes 1 and 2, the
-				// resume lands on the third, 3.
-				assert.Equal(t, "00000000000000003-0000000003", next[0].ID)
+			require.NotEmpty(t, cursor)
+
+			next, _, err := st.QueryEvents(ctx, EventFilter{Limit: 2, Cursor: cursor, Scope: WildcardScope()})
+			require.NoError(t, err)
+			// A two-wide page resumes at the third row, so the resumed page
+			// has two events, not ten.
+			require.Len(t, next, 2)
+			assert.Equal(t, seeded[2].ID, next[0].ID)
 		})
 
-		t.Run("mismatched cursor rejects", func(t *testing.T) {				_, _, err := st.QueryEvents(ctx, EventFilter{OrderBy: OrderByLedger, Limit: 2, Cursor: idCursor, Scope: WildcardScope()})
+		t.Run("mismatched cursor rejects", func(t *testing.T) {
+			// A cursor minted under the default ordering is a bare id; ask
+			// for it under a ledger sort and decodeCompositeCursor cannot
+			// parse the bare id as a ledger.
+			_, _, err := st.QueryEvents(ctx, EventFilter{
+				OrderBy: OrderByLedger,
+				Limit:   2,
+				Cursor:  idCursor,
+				Scope:   WildcardScope(),
+			})
 			assert.ErrorIs(t, err, ErrInvalidCursor)
 		})
 	})
