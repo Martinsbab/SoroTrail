@@ -42,7 +42,7 @@ func TestQueryEvents_FilterCombinations(t *testing.T) {
 			if i%3 == 0 {
 				contract = contractB
 			}
-			ev := testEvent(eventID(i), 100+i, contract)
+			ev := testEvent(eventID(int(i)), 100+i, contract)
 			ev.Type = "contract"
 			ev.TxHash = "tx" + string(rune('a'+i))
 			if i%4 == 0 {
@@ -324,7 +324,7 @@ func TestQueryEvents_FilterCombinations(t *testing.T) {
 			_, _, err := st.QueryEvents(ctx, EventFilter{
 				OrderBy: OrderByLedger,
 				Limit:   2,
-				Cursor:  idCursor,
+				Cursor:  EncodeCursor(OrderByID, seededOrder[0]),
 				Scope:   WildcardScope(),
 			})
 			assert.ErrorIs(t, err, ErrInvalidCursor)
@@ -374,16 +374,4 @@ func TestQueryEvents_FilterCombinations(t *testing.T) {
 			t.Logf("cleaning up shared Postgres: %v", err)
 		}
 	})
-}
-
-// assertIDOrder checks that two event IDs are in the requested traversal
-// direction, which is the definition of "sorted" for every order_by mode in
-// this package.
-func assertIDOrder(t *testing.T, prev, cur string, desc bool) {
-	t.Helper()
-	if desc {
-		assert.Greater(t, prev, cur)
-	} else {
-		assert.Less(t, prev, cur)
-	}
 }
