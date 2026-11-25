@@ -4,6 +4,8 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,22 +257,22 @@ func TestWatchedContracts_UnionAndRefcounting(t *testing.T) {
 	two := mustTenant(t, p, "two")
 
 	// The operator's global list still counts.
-	require.NoError(t, p.AddWatchedContract(ctx, contractC))
+	require.NoError(t, p.AddWatchedContract(ctx, WatchedContract{ContractID: contractC}))
 
-	require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractA, 0))
-	require.NoError(t, p.AddTenantWatchedContract(ctx, two, contractA, 0))
-	require.NoError(t, p.AddTenantWatchedContract(ctx, two, contractB, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractB, 0))
 
 	assert.Equal(t, []string{contractA, contractB, contractC}, watchedContractIDs(t, p),
 		"a contract two tenants both want appears once")
 
 	// One tenant drops the shared contract; the other still needs it.
-	require.NoError(t, p.RemoveTenantWatchedContract(ctx, one.ID, contractA))
+	require.NoError(t, p.RemoveTenantWatchedContract(ctx, one.ID, "", contractA))
 	assert.Contains(t, watchedContractIDs(t, p), contractA,
 		"a contract another tenant still watches must keep being ingested")
 
 	// The last tenant drops it: now it leaves the union.
-	require.NoError(t, p.RemoveTenantWatchedContract(ctx, two.ID, contractA))
+	require.NoError(t, p.RemoveTenantWatchedContract(ctx, two.ID, "", contractA))
 	watched := watchedContractIDs(t, p)
 	assert.NotContains(t, watched, contractA)
 	assert.Contains(t, watched, contractB)
@@ -285,9 +287,9 @@ func TestDeleteTenant_ReleasesWatchClaims(t *testing.T) {
 
 	one := mustTenant(t, p, "one")
 	two := mustTenant(t, p, "two")
-	require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractA, 0))
-	require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractB, 0))
-	require.NoError(t, p.AddTenantWatchedContract(ctx, two, contractB, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractB, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractB, 0))
 
 	require.NoError(t, p.DeleteTenant(ctx, one.ID))
 
@@ -310,12 +312,12 @@ func TestWatchedContracts_Quotas(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, contractA, 0))
-		err = p.AddTenantWatchedContract(ctx, tenant, contractB, 0)
+		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
+		err = p.AddTenantWatchedContract(ctx, tenant, "", contractB, 0)
 		assert.ErrorIs(t, err, ErrQuotaExceeded)
 
 		// Re-adding something already held stays idempotent at the cap.
-		assert.NoError(t, p.AddTenantWatchedContract(ctx, tenant, contractA, 0))
+		assert.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
 	})
 
 	t.Run("the instance cap bounds the union", func(t *testing.T) {
@@ -323,24 +325,24 @@ func TestWatchedContracts_Quotas(t *testing.T) {
 		one := mustTenant(t, p, "one")
 		two := mustTenant(t, p, "two")
 
-		require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractA, 2))
-		require.NoError(t, p.AddTenantWatchedContract(ctx, one, contractB, 2))
+		require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractA, 2))
+		require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractB, 2))
 
-		err := p.AddTenantWatchedContract(ctx, two, contractC, 2)
+		err := p.AddTenantWatchedContract(ctx, two, "", contractC, 2)
 		assert.ErrorIs(t, err, ErrQuotaExceeded, "a third distinct contract exceeds the cap")
 
 		// A contract already in the union costs nothing to join, because
 		// the cap bounds ingestion cost and that contract is already polled.
-		assert.NoError(t, p.AddTenantWatchedContract(ctx, two, contractA, 2))
+		assert.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractA, 2))
 	})
 
 	t.Run("no cap means unlimited", func(t *testing.T) {
 		p := testTenantStore(t)
 		tenant := mustTenant(t, p, "uncapped")
 		for _, c := range []string{contractA, contractB, contractC} {
-			require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, c, 0))
+			require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", c, 0))
 		}
-		watched, err := p.ListTenantWatchedContracts(ctx, tenant.ID)
+		watched, err := p.ListTenantWatchedContracts(ctx, tenant.ID, "")
 		require.NoError(t, err)
 		assert.Len(t, watched, 3)
 	})
@@ -354,7 +356,7 @@ func TestWatchingDoesNotGrantAccess(t *testing.T) {
 	ctx := context.Background()
 
 	tenant := mustTenant(t, p, "watcher")
-	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
 
 	sc, err := p.ScopeForTenant(ctx, tenant)
 	require.NoError(t, err)
@@ -366,6 +368,29 @@ func TestWatchingDoesNotGrantAccess(t *testing.T) {
 	got, _, err := p.QueryEvents(ctx, EventFilter{Scope: sc})
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+func TestWatchedContracts_MultiNetwork(t *testing.T) {
+	p := testTenantStore(t)
+	ctx := context.Background()
+
+	tenant := mustTenant(t, p, "multi-net")
+	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "mainnet", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "testnet", contractA, 0))
+	require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "testnet", contractB, 0))
+
+	mainnetWatched, err := p.ListTenantWatchedContracts(ctx, tenant.ID, "mainnet")
+	require.NoError(t, err)
+	assert.Equal(t, []string{contractA}, mainnetWatched)
+
+	testnetWatched, err := p.ListTenantWatchedContracts(ctx, tenant.ID, "testnet")
+	require.NoError(t, err)
+	assert.Equal(t, []string{contractA, contractB}, testnetWatched)
+
+	require.NoError(t, p.RemoveTenantWatchedContract(ctx, tenant.ID, "testnet", contractA))
+	mainnetWatched, err = p.ListTenantWatchedContracts(ctx, tenant.ID, "mainnet")
+	require.NoError(t, err)
+	assert.Equal(t, []string{contractA}, mainnetWatched, "mainnet watch is preserved when testnet watch is removed")
 }
 
 func TestTenantAPIKeys(t *testing.T) {
@@ -578,4 +603,193 @@ func watchedContractIDs(t *testing.T, p *Postgres) []string {
 		ids = append(ids, w.ContractID)
 	}
 	return ids
+}
+
+// The headroom the API reports (#1157) is counted with the same queries
+// AddTenantWatchedContract enforces its caps with, so what a tenant is told it
+// holds is exactly what the limit compares against.
+func TestWatchedContracts_CountsAgreeWithTheEnforcedCaps(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a tenant's count tracks adds and stops at its cap", func(t *testing.T) {
+		p := testTenantStore(t)
+		limit := 2
+		tenant, err := p.CreateTenant(ctx, Tenant{Name: "capped", Enabled: true, MaxWatchedContracts: &limit})
+		require.NoError(t, err)
+
+		n, err := p.CountTenantWatchedContracts(ctx, tenant.ID)
+		require.NoError(t, err)
+		assert.Equal(t, 0, n, "an empty watch list")
+
+		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
+		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractB, 0))
+		n, err = p.CountTenantWatchedContracts(ctx, tenant.ID)
+		require.NoError(t, err)
+		assert.Equal(t, limit, n, "exactly at the cap")
+
+		// The add that the cap refuses leaves the count where it was.
+		require.ErrorIs(t, p.AddTenantWatchedContract(ctx, tenant, "", contractC, 0), ErrQuotaExceeded)
+		n, err = p.CountTenantWatchedContracts(ctx, tenant.ID)
+		require.NoError(t, err)
+		assert.Equal(t, limit, n)
+
+		// An idempotent re-add does not inflate it.
+		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
+		n, err = p.CountTenantWatchedContracts(ctx, tenant.ID)
+		require.NoError(t, err)
+		assert.Equal(t, limit, n)
+	})
+
+	t.Run("a tenant's count excludes other tenants' claims", func(t *testing.T) {
+		p := testTenantStore(t)
+		one := mustTenant(t, p, "one")
+		two := mustTenant(t, p, "two")
+		require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractA, 0))
+		require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractA, 0))
+		require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractB, 0))
+
+		n, err := p.CountTenantWatchedContracts(ctx, one.ID)
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+	})
+
+	t.Run("the instance count is the union the instance cap bounds", func(t *testing.T) {
+		p := testTenantStore(t)
+		one := mustTenant(t, p, "one")
+		two := mustTenant(t, p, "two")
+
+		require.NoError(t, p.AddTenantWatchedContract(ctx, one, "", contractA, 2))
+		require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractA, 2))
+		n, err := p.CountInstanceWatchedContracts(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, n, "two tenants watching one contract is one entry in the union")
+
+		require.NoError(t, p.AddTenantWatchedContract(ctx, two, "", contractB, 2))
+		n, err = p.CountInstanceWatchedContracts(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, n, "at the cap of 2")
+
+		// The count says full, and the enforcement agrees.
+		assert.ErrorIs(t, p.AddTenantWatchedContract(ctx, one, "", contractC, 2), ErrQuotaExceeded)
+	})
+}
+
+func syntheticContractID(i int) string {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+	b := make([]byte, 56)
+	b[0] = 'C'
+	n := i + 1
+	for pos := 55; pos >= 1; pos-- {
+		b[pos] = alphabet[n%32]
+		n /= 32
+	}
+	return string(b)
+}
+
+// TestAddTenantWatchedContract_ConcurrentCapEnforcement fires parallel adds at
+// a tenant one below its cap and at two tenants competing for the final
+// instance-wide slot (#1140).
+func TestAddTenantWatchedContract_ConcurrentCapEnforcement(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("parallel adds for one tenant one below its cap admit exactly one", func(t *testing.T) {
+		p := testTenantStore(t)
+		capLimit := 2
+		tenant, err := p.CreateTenant(ctx, Tenant{
+			Name:                "race-tenant",
+			Enabled:             true,
+			MaxWatchedContracts: &capLimit,
+		})
+		require.NoError(t, err)
+
+		// Pre-fill to cap - 1.
+		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
+
+		const workers = 16
+		start := make(chan struct{})
+		errs := make(chan error, workers)
+		var wg sync.WaitGroup
+		for i := range workers {
+			cid := syntheticContractID(i)
+			wg.Add(1)
+			go func(contract string) {
+				defer wg.Done()
+				<-start
+				errs <- p.AddTenantWatchedContract(ctx, tenant, "", contract, 0)
+			}(cid)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+
+		var successes, quotaExceededs int
+		for err := range errs {
+			switch {
+			case err == nil:
+				successes++
+			case assert.ErrorIs(t, err, ErrQuotaExceeded, "unexpected error: %v", err):
+				quotaExceededs++
+			}
+		}
+		assert.Equal(t, 1, successes, "exactly one concurrent add may take the last tenant slot")
+		assert.Equal(t, workers-1, quotaExceededs)
+
+		held, err := p.CountTenantWatchedContracts(ctx, tenant.ID)
+		require.NoError(t, err)
+		assert.Equal(t, capLimit, held)
+
+		// Idempotent re-add of an already held contract still succeeds at cap.
+		require.NoError(t, p.AddTenantWatchedContract(ctx, tenant, "", contractA, 0))
+	})
+
+	t.Run("parallel adds across two tenants one below instance cap admit", func(t *testing.T) {
+		p := testTenantStore(t)
+		t1 := mustTenant(t, p, "race-inst-1")
+		t2 := mustTenant(t, p, "race-inst-2")
+
+		const instanceCap = 2
+		// Pre-fill 1 contract in the union (instanceCap - 1).
+		require.NoError(t, p.AddTenantWatchedContract(ctx, t1, "", contractA, instanceCap))
+
+		const perTenantWorkers = 8
+		totalWorkers := perTenantWorkers * 2
+		start := make(chan struct{})
+		errs := make(chan error, totalWorkers)
+		var wg sync.WaitGroup
+
+		for i := range perTenantWorkers {
+			c1 := syntheticContractID(100 + i)
+			c2 := syntheticContractID(200 + i)
+			wg.Add(2)
+			go func(contract string) {
+				defer wg.Done()
+				<-start
+				errs <- p.AddTenantWatchedContract(ctx, t1, "", contract, instanceCap)
+			}(c1)
+			go func(contract string) {
+				defer wg.Done()
+				<-start
+				errs <- p.AddTenantWatchedContract(ctx, t2, "", contract, instanceCap)
+			}(c2)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+
+		var successes, quotaExceededs int
+		for err := range errs {
+			switch {
+			case err == nil:
+				successes++
+			case assert.ErrorIs(t, err, ErrQuotaExceeded, fmt.Sprintf("unexpected error: %v", err)):
+				quotaExceededs++
+			}
+		}
+		assert.Equal(t, 1, successes, "exactly one concurrent add across tenants may take the last instance slot")
+		assert.Equal(t, totalWorkers-1, quotaExceededs)
+
+		unionHeld, err := p.CountInstanceWatchedContracts(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, instanceCap, unionHeld)
+	})
 }

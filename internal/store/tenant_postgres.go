@@ -14,7 +14,8 @@ import (
 var _ TenantStore = (*Postgres)(nil)
 
 const tenantColumns = `id, name, wildcard, is_admin, enabled,
-	rate_limit_rps, rate_limit_burst, max_watched_contracts, created_at`
+	rate_limit_rps, rate_limit_burst, max_watched_contracts,
+	retention_max_age_seconds, created_at`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -23,7 +24,8 @@ type rowScanner interface {
 func scanTenant(row rowScanner) (Tenant, error) {
 	var t Tenant
 	err := row.Scan(&t.ID, &t.Name, &t.Wildcard, &t.Admin, &t.Enabled,
-		&t.RateLimitRPS, &t.RateLimitBurst, &t.MaxWatchedContracts, &t.CreatedAt)
+		&t.RateLimitRPS, &t.RateLimitBurst, &t.MaxWatchedContracts,
+		&t.RetentionMaxAgeSeconds, &t.CreatedAt)
 	return t, err
 }
 
@@ -38,11 +40,13 @@ func isUniqueViolation(err error) bool {
 func (p *Postgres) CreateTenant(ctx context.Context, t Tenant) (Tenant, error) {
 	row := p.pool.QueryRow(ctx, `
 		INSERT INTO tenants (name, wildcard, is_admin, enabled,
-			rate_limit_rps, rate_limit_burst, max_watched_contracts)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+			rate_limit_rps, rate_limit_burst, max_watched_contracts,
+			retention_max_age_seconds)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING `+tenantColumns,
 		t.Name, t.Wildcard, t.Admin, t.Enabled,
-		t.RateLimitRPS, t.RateLimitBurst, t.MaxWatchedContracts)
+		t.RateLimitRPS, t.RateLimitBurst, t.MaxWatchedContracts,
+		t.RetentionMaxAgeSeconds)
 	created, err := scanTenant(row)
 	if isUniqueViolation(err) {
 		return Tenant{}, fmt.Errorf("tenant %q: %w", t.Name, ErrDuplicate)
@@ -99,11 +103,13 @@ func (p *Postgres) UpdateTenant(ctx context.Context, t Tenant) (Tenant, error) {
 	row := p.pool.QueryRow(ctx, `
 		UPDATE tenants SET
 			name = $2, wildcard = $3, is_admin = $4, enabled = $5,
-			rate_limit_rps = $6, rate_limit_burst = $7, max_watched_contracts = $8
+			rate_limit_rps = $6, rate_limit_burst = $7, max_watched_contracts = $8,
+			retention_max_age_seconds = $9
 		WHERE id = $1
 		RETURNING `+tenantColumns,
 		t.ID, t.Name, t.Wildcard, t.Admin, t.Enabled,
-		t.RateLimitRPS, t.RateLimitBurst, t.MaxWatchedContracts)
+		t.RateLimitRPS, t.RateLimitBurst, t.MaxWatchedContracts,
+		t.RetentionMaxAgeSeconds)
 	updated, err := scanTenant(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Tenant{}, ErrNotFound
@@ -178,24 +184,104 @@ func (p *Postgres) ScopeForTenant(ctx context.Context, t Tenant) (Scope, error) 
 	return NewScope(ids), nil
 }
 
+var _ RetentionPolicyStore = (*Postgres)(nil)
+
+// ListTenantRetention returns every tenant's retention override and grants
+// in one round trip. Disabled tenants are included on purpose: suspension
+// is reversible, and a suspended customer is still entitled to its history
+// when it comes back.
+func (p *Postgres) ListTenantRetention(ctx context.Context) ([]TenantRetention, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT t.id, t.wildcard, t.retention_max_age_seconds,
+		       coalesce(array_agg(g.contract_id ORDER BY g.contract_id)
+		                FILTER (WHERE g.contract_id IS NOT NULL), '{}')
+		FROM tenants t
+		LEFT JOIN tenant_contract_grants g ON g.tenant_id = t.id
+		GROUP BY t.id
+		ORDER BY t.id`)
+	if err != nil {
+		return nil, fmt.Errorf("listing tenant retention: %w", err)
+	}
+	defer rows.Close()
+
+	out := []TenantRetention{}
+	for rows.Next() {
+		var (
+			tr      TenantRetention
+			seconds *int64
+		)
+		if err := rows.Scan(&tr.TenantID, &tr.Wildcard, &seconds, &tr.Contracts); err != nil {
+			return nil, fmt.Errorf("scanning tenant retention: %w", err)
+		}
+		tr.MaxAge = Tenant{RetentionMaxAgeSeconds: seconds}.RetentionOverride()
+		out = append(out, tr)
+	}
+	return out, rows.Err()
+}
+
+// The two counts AddTenantWatchedContract enforces its caps with. They are
+// constants shared with the reporting methods below so that the headroom a
+// tenant is shown is measured exactly the way the limit is applied.
+const (
+	countTenantWatchedSQL   = `SELECT count(*) FROM tenant_watched_contracts WHERE tenant_id = $1`
+	countInstanceWatchedSQL = `SELECT count(*) FROM (` + watchedContractsUnion + `) u`
+
+	// instanceWatchCapAdvisoryLockKey is the transaction-scoped Postgres
+	// advisory lock key used by AddTenantWatchedContract whenever an
+	// instance-wide watch cap (MULTI_TENANT_MAX_WATCHED) is enforced (#1140).
+	instanceWatchCapAdvisoryLockKey int64 = 0x53545F5741544348 // "ST_WATCH"
+)
+
+// CountTenantWatchedContracts returns how many contracts the tenant watches.
+func (p *Postgres) CountTenantWatchedContracts(ctx context.Context, tenantID int64) (int, error) {
+	var n int
+	if err := p.pool.QueryRow(ctx, countTenantWatchedSQL, tenantID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("counting tenant watch list: %w", err)
+	}
+	return n, nil
+}
+
+// CountInstanceWatchedContracts returns the size of the union of every watch
+// list, which is what the instance-wide cap bounds.
+func (p *Postgres) CountInstanceWatchedContracts(ctx context.Context) (int, error) {
+	var n int
+	if err := p.pool.QueryRow(ctx, countInstanceWatchedSQL).Scan(&n); err != nil {
+		return 0, fmt.Errorf("counting watched union: %w", err)
+	}
+	return n, nil
+}
+
 // AddTenantWatchedContract adds a contract to the tenant's watch list,
 // enforcing the tenant's own cap and the instance-wide cap.
 //
-// Both checks and the insert run in one transaction, so two concurrent
-// requests cannot each observe headroom for the last slot and both take it.
-func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contractID string, instanceCap int) error {
+// Under Postgres' default READ COMMITTED isolation, running SELECT count(*)
+// and INSERT inside a transaction without locking allows concurrent requests
+// to observe the same pre-commit count and overrun both caps (#1140). To
+// serialise cap checks without penalising the idempotent re-add path:
+//   - The idempotent re-add check runs first with no lock.
+//   - Before counting a tenant's watched contracts, the tenant's row in
+//     tenants is locked with SELECT ... FOR UPDATE, serialising concurrent
+//     adds for the same tenant.
+//   - When an instance-wide cap is configured, pg_advisory_xact_lock is
+//     acquired before counting the union across tenants, serialising
+//     concurrent adds across different tenants competing for the last
+//     instance slot. Both locks release automatically when tx commits or
+//     rolls back.
+func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, network, contractID string, instanceCap int) error {
+	network = defaultNetwork(network)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("starting watch-list transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Already held: nothing to check, nothing to do. Checked first so a
-	// tenant at its cap can still re-issue an add idempotently.
+	// Already held: nothing to check, nothing to do. Checked first before
+	// acquiring any row or advisory lock so a tenant at its cap can re-issue
+	// an add idempotently without contending on locks.
 	var exists int
 	err = tx.QueryRow(ctx, `
 		SELECT 1 FROM tenant_watched_contracts
-		WHERE tenant_id = $1 AND contract_id = $2`, t.ID, contractID).Scan(&exists)
+		WHERE tenant_id = $1 AND network = $2 AND contract_id = $3`, t.ID, network, contractID).Scan(&exists)
 	if err == nil {
 		return nil
 	}
@@ -203,11 +289,29 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contr
 		return fmt.Errorf("checking watch list: %w", err)
 	}
 
+	// Lock the tenant row so concurrent adds for the same tenant serialise
+	// before counting held contracts. Re-check after locking in case a
+	// concurrent request just inserted the same contract.
+	var lockedTenantID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM tenants WHERE id = $1 FOR UPDATE`, t.ID).Scan(&lockedTenantID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("locking tenant row for watch-list cap check: %w", err)
+	}
+	err = tx.QueryRow(ctx, `
+		SELECT 1 FROM tenant_watched_contracts
+		WHERE tenant_id = $1 AND network = $2 AND contract_id = $3`, t.ID, network, contractID).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("re-checking watch list under lock: %w", err)
+	}
+
 	if t.MaxWatchedContracts != nil {
 		var held int
-		if err := tx.QueryRow(ctx,
-			`SELECT count(*) FROM tenant_watched_contracts WHERE tenant_id = $1`,
-			t.ID).Scan(&held); err != nil {
+		if err := tx.QueryRow(ctx, countTenantWatchedSQL, t.ID).Scan(&held); err != nil {
 			return fmt.Errorf("counting tenant watch list: %w", err)
 		}
 		if held >= *t.MaxWatchedContracts {
@@ -217,19 +321,25 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contr
 	}
 
 	if instanceCap > 0 {
+		// Serialise instance-wide union cap checks across all tenants using a
+		// transaction-scoped advisory lock.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, instanceWatchCapAdvisoryLockKey); err != nil {
+			return fmt.Errorf("acquiring instance watch-list advisory lock: %w", err)
+		}
+
 		// The instance cap bounds the union, not any single list: what
 		// costs the operator RPC budget is the number of distinct
-		// contracts ingestion must poll. A contract another tenant already
-		// watches is therefore free to add.
+		// (network, contract_id) pairs ingestion must poll. A contract
+		// another tenant already watches on this network is therefore free
+		// to add.
 		var unionSize int
-		if err := tx.QueryRow(ctx,
-			`SELECT count(*) FROM (`+watchedContractsUnion+`) u`).Scan(&unionSize); err != nil {
+		if err := tx.QueryRow(ctx, countInstanceWatchedSQL).Scan(&unionSize); err != nil {
 			return fmt.Errorf("counting watched union: %w", err)
 		}
 		var alreadyWatched int
 		err := tx.QueryRow(ctx,
-			`SELECT 1 FROM (`+watchedContractsUnion+`) u WHERE contract_id = $1`,
-			contractID).Scan(&alreadyWatched)
+			`SELECT 1 FROM (`+watchedContractsUnion+`) u WHERE network = $1 AND contract_id = $2`,
+			network, contractID).Scan(&alreadyWatched)
 		switch {
 		case err == nil:
 			// Already in the union; adding this tenant's claim does not
@@ -245,8 +355,9 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contr
 	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO tenant_watched_contracts (tenant_id, contract_id)
-		VALUES ($1, $2) ON CONFLICT DO NOTHING`, t.ID, contractID); err != nil {
+		INSERT INTO tenant_watched_contracts (tenant_id, network, contract_id)
+		VALUES ($1, $2, $3) ON CONFLICT (tenant_id, network, contract_id) DO NOTHING`,
+		t.ID, network, contractID); err != nil {
 		return fmt.Errorf("adding tenant watched contract: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -255,20 +366,22 @@ func (p *Postgres) AddTenantWatchedContract(ctx context.Context, t Tenant, contr
 	return nil
 }
 
-func (p *Postgres) RemoveTenantWatchedContract(ctx context.Context, tenantID int64, contractID string) error {
+func (p *Postgres) RemoveTenantWatchedContract(ctx context.Context, tenantID int64, network, contractID string) error {
+	network = defaultNetwork(network)
 	_, err := p.pool.Exec(ctx,
-		`DELETE FROM tenant_watched_contracts WHERE tenant_id = $1 AND contract_id = $2`,
-		tenantID, contractID)
+		`DELETE FROM tenant_watched_contracts WHERE tenant_id = $1 AND network = $2 AND contract_id = $3`,
+		tenantID, network, contractID)
 	if err != nil {
 		return fmt.Errorf("removing tenant watched contract: %w", err)
 	}
 	return nil
 }
 
-func (p *Postgres) ListTenantWatchedContracts(ctx context.Context, tenantID int64) ([]string, error) {
+func (p *Postgres) ListTenantWatchedContracts(ctx context.Context, tenantID int64, network string) ([]string, error) {
+	network = defaultNetwork(network)
 	return p.queryContractIDs(ctx,
-		`SELECT contract_id FROM tenant_watched_contracts WHERE tenant_id = $1 ORDER BY contract_id`,
-		tenantID)
+		`SELECT contract_id FROM tenant_watched_contracts WHERE tenant_id = $1 AND network = $2 ORDER BY contract_id`,
+		tenantID, network)
 }
 
 // queryContractIDs runs query — whose first column is a contract id — and
@@ -355,7 +468,8 @@ func (p *Postgres) LookupTenantAPIKey(ctx context.Context, prefix string) (Tenan
 		SELECT k.id, k.tenant_id, k.name, k.prefix, k.created_at, k.last_used_at, k.revoked_at,
 		       k.key_hash,
 		       t.id, t.name, t.wildcard, t.is_admin, t.enabled,
-		       t.rate_limit_rps, t.rate_limit_burst, t.max_watched_contracts, t.created_at
+		       t.rate_limit_rps, t.rate_limit_burst, t.max_watched_contracts,
+		       t.retention_max_age_seconds, t.created_at
 		FROM tenant_api_keys k
 		JOIN tenants t ON t.id = k.tenant_id
 		WHERE k.prefix = $1 AND k.revoked_at IS NULL`, prefix)
@@ -368,7 +482,8 @@ func (p *Postgres) LookupTenantAPIKey(ctx context.Context, prefix string) (Tenan
 	err := row.Scan(&k.ID, &k.TenantID, &k.Name, &k.Prefix, &k.CreatedAt, &k.LastUsedAt, &k.RevokedAt,
 		&digest,
 		&t.ID, &t.Name, &t.Wildcard, &t.Admin, &t.Enabled,
-		&t.RateLimitRPS, &t.RateLimitBurst, &t.MaxWatchedContracts, &t.CreatedAt)
+		&t.RateLimitRPS, &t.RateLimitBurst, &t.MaxWatchedContracts,
+		&t.RetentionMaxAgeSeconds, &t.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return TenantAPIKey{}, nil, Tenant{}, ErrNotFound
 	}

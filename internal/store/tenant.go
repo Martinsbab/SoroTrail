@@ -35,8 +35,23 @@ type Tenant struct {
 	// MaxWatchedContracts caps how many contracts this tenant may add to
 	// the ingestion watch list. Nil means unlimited, still subject to the
 	// instance-wide cap.
-	MaxWatchedContracts *int      `json:"max_watched_contracts,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
+	MaxWatchedContracts *int `json:"max_watched_contracts,omitempty"`
+	// RetentionMaxAgeSeconds is the tenant's own event-retention horizon.
+	// Nil inherits the instance default. Because events are shared between
+	// tenants, this is what the tenant is entitled to, not a promise that
+	// rows are deleted at exactly this age: see tenant_retention.go.
+	RetentionMaxAgeSeconds *int64    `json:"retention_max_age_seconds,omitempty"`
+	CreatedAt              time.Time `json:"created_at"`
+}
+
+// RetentionOverride returns the tenant's retention horizon as a duration,
+// or nil when it inherits the instance default.
+func (t Tenant) RetentionOverride() *time.Duration {
+	if t.RetentionMaxAgeSeconds == nil || *t.RetentionMaxAgeSeconds <= 0 {
+		return nil
+	}
+	d := time.Duration(*t.RetentionMaxAgeSeconds) * time.Second
+	return &d
 }
 
 // TenantAPIKey is a credential belonging to a tenant. The secret itself is never
@@ -108,13 +123,25 @@ type TenantStore interface {
 	// the ingestion union. instanceCap bounds the size of the union across
 	// all tenants; 0 means no instance cap. Returns ErrQuotaExceeded when
 	// either the tenant's own cap or the instance cap would be exceeded.
-	AddTenantWatchedContract(ctx context.Context, t Tenant, contractID string, instanceCap int) error
+	AddTenantWatchedContract(ctx context.Context, t Tenant, network, contractID string, instanceCap int) error
 	// RemoveTenantWatchedContract drops one tenant's claim on a contract.
 	// The contract remains ingested while any other tenant, or the global
 	// watched_contracts list, still names it.
-	RemoveTenantWatchedContract(ctx context.Context, tenantID int64, contractID string) error
-	// ListTenantWatchedContracts returns just this tenant's claims.
-	ListTenantWatchedContracts(ctx context.Context, tenantID int64) ([]string, error)
+	RemoveTenantWatchedContract(ctx context.Context, tenantID int64, network, contractID string) error
+	// ListTenantWatchedContracts returns just this tenant's claims on network.
+	ListTenantWatchedContracts(ctx context.Context, tenantID int64, network string) ([]string, error)
+	// CountTenantWatchedContracts returns how many contracts the tenant holds
+	// on its watch list across every network. It is the figure
+	// AddTenantWatchedContract compares with the tenant's own cap, counted by
+	// the same query, so a reported headroom and an enforced limit cannot
+	// disagree.
+	CountTenantWatchedContracts(ctx context.Context, tenantID int64) (int, error)
+	// CountInstanceWatchedContracts returns the size of the union
+	// AddTenantWatchedContract compares with the instance-wide cap: distinct
+	// (network, contract_id) pairs across the global watch list and every
+	// tenant's. It is aggregate data about all tenants, so only the operator
+	// view may expose it as a number.
+	CountInstanceWatchedContracts(ctx context.Context) (int, error)
 
 	// CreateTenantAPIKey stores the digest of secret and returns the key record.
 	CreateTenantAPIKey(ctx context.Context, tenantID int64, name, prefix string, digest []byte) (TenantAPIKey, error)

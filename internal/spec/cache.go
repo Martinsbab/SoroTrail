@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +74,13 @@ type Cache struct {
 	hashTTL  time.Duration
 	now      func() time.Time
 
+	// publisher tells the other replicas that a contract's cached spec
+	// changed. It is optional: a single-process deployment has nobody to
+	// tell.
+	publisher Invalidator
+	// log receives the cache's own diagnostics.
+	log *slog.Logger
+
 	mu     sync.Mutex
 	mem    map[string]*entry    // wasm_hash → spec entry
 	hashes map[string]hashEntry // contract_id → wasm hash mapping
@@ -82,6 +90,9 @@ type Cache struct {
 	fetches       atomic.Uint64
 	expiries      atomic.Uint64
 	invalidations atomic.Uint64
+	// invalidationsReceived counts the invalidations this process applied
+	// because another replica said so.
+	invalidationsReceived atomic.Uint64
 }
 
 // Option configures the cache.
@@ -186,14 +197,22 @@ func (c *Cache) GetForContract(ctx context.Context, contractID string) *Contract
 			return nil
 		}
 		c.mu.Lock()
+		upgraded := false
 		if known && he.hash != current {
 			// Contract upgrade: the wasm hash changed, so the old
 			// spec can no longer describe this contract's events.
 			delete(c.mem, he.hash)
 			c.invalidations.Add(1)
+			upgraded = true
 		}
 		c.hashes[contractID] = hashEntry{hash: current, checked: c.now()}
 		c.mu.Unlock()
+		if upgraded {
+			// The other replicas hold the old spec too, so they have to be
+			// told: otherwise the same request decodes differently depending
+			// on which replica served it.
+			c.publishInvalidation(ctx, contractID)
+		}
 		he = hashEntry{hash: current}
 	}
 
@@ -223,7 +242,18 @@ func (c *Cache) GetByContractID(contractID string) *ContractSpec {
 }
 
 // Set stores a spec in both memory and (if configured) database.
-// Counts a fetch: Set is only called after a spec was (re)fetched.
+//
+// This method is called after a spec has been (re)fetched from the contract
+// RPC. It updates the in-memory cache and optionally persists the spec to
+// the durable store. The fetch counter is incremented to track how many
+// specs have been stored.
+//
+// The spec is stored in the in-memory map keyed by its WasmHash. If the spec
+// has a non-empty ContractID, the contractID → wasm-hash mapping is also
+// updated so that future lookups by contract ID can find the correct hash.
+//
+// If a dbStore is configured, the spec is also marshaled to JSON and
+// persisted via SetContractSpec.
 func (c *Cache) Set(ctx context.Context, spec *ContractSpec) error {
 	c.mu.Lock()
 	c.mem[spec.WasmHash] = &entry{spec: spec, cachedAt: c.now()}
@@ -247,8 +277,8 @@ func (c *Cache) Set(ctx context.Context, spec *ContractSpec) error {
 
 // Put stores a spec in the in-memory cache only (no db persistence, no
 // fetch counter). Used for user-supplied spec overrides, which live in
-// their own store table and are authoritative until replaced or deleted —
-// so they bypass the TTL expiry by being re-checked on the next miss.
+// their own store table. The entry is still subject to the cache TTL (see
+// get); invalidation is what makes a replacement visible immediately.
 func (c *Cache) Put(key string, spec *ContractSpec) {
 	c.mu.Lock()
 	c.mem[key] = &entry{spec: spec, cachedAt: c.now()}
@@ -273,6 +303,26 @@ func (c *Cache) InvalidateContract(contractID string) {
 		delete(c.mem, he.hash)
 		delete(c.hashes, contractID)
 	}
+	c.mu.Unlock()
+	if ok {
+		c.invalidations.Add(1)
+	}
+}
+
+// InvalidateOverride evicts the parsed user-supplied override for a contract.
+// The override is cached in the same map as the fetched specs, under the
+// "override:<contractID>" key, so it needs its own eviction: a fetched spec
+// and an override are different things and a write to one says nothing about
+// the other.
+//
+// Overrides are authoritative until they are replaced or deleted, but the
+// cache still applies its TTL to this entry (see get), so this is not the
+// only way a stale override leaves the cache; it is, however, the way a
+// write makes the change visible immediately.
+func (c *Cache) InvalidateOverride(contractID string) {
+	c.mu.Lock()
+	_, ok := c.mem[overrideKeyPrefix+contractID]
+	delete(c.mem, overrideKeyPrefix+contractID)
 	c.mu.Unlock()
 	if ok {
 		c.invalidations.Add(1)

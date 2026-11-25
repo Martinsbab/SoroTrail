@@ -24,10 +24,13 @@ jobs:
             **/*.go
           cache: true
 
+      - name: Verify reproducible binary build
+        run: ./scripts/verify_reproducible_build.sh
+
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: latest
+          version: v2.18.3
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -234,7 +234,7 @@ func (p surface) check(got wireShape) []string {
 // their own right because clients bind to them, not to the wrapper.
 var responseSurfaces = []surface{
 	{"errorResponse", reflect.TypeOf(errorResponse{}),
-		[]string{"error"}, nil},
+		[]string{"error", "code"}, []string{"field"}},
 	{"eventsResponse", reflect.TypeOf(eventsResponse{}),
 		[]string{"events"}, []string{"cursor"}},
 	{"enrichedEventsResponse", reflect.TypeOf(enrichedEventsResponse{}),
@@ -269,9 +269,9 @@ var responseSurfaces = []surface{
 	{"deadLetterListResponse", reflect.TypeOf(deadLetterListResponse{}),
 		[]string{"dead_letters", "count"}, []string{"cursor"}},
 	{"addWatchedResponse", reflect.TypeOf(addWatchedResponse{}),
-		[]string{"contract_id", "added_at", "history_from_ledger"}, []string{"mode_transition"}},
+		[]string{"contract_id", "network", "added_at", "history_from_ledger"}, []string{"mode_transition"}},
 	{"removeWatchedResponse", reflect.TypeOf(removeWatchedResponse{}),
-		[]string{"contract_id", "removed_at", "history_preserved"}, []string{"mode_transition"}},
+		[]string{"contract_id", "network", "removed_at", "history_preserved"}, []string{"mode_transition"}},
 	{"watchedListResponse", reflect.TypeOf(watchedListResponse{}),
 		[]string{"contracts", "count"}, nil},
 	{"contractStatsResponse", reflect.TypeOf(contractStatsResponse{}),

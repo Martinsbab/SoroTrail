@@ -18,6 +18,12 @@ type TracingStore struct {
 	tracer trace.Tracer
 }
 
+// TracingStore is passed to callers as Store, so it must keep satisfying the
+// interface as it evolves. This assertion catches a wrapped method whose
+// signature drifts from the interface; methods that are still promoted from
+// the embedded Store are listed in the tracing coverage note on #1154.
+var _ Store = (*TracingStore)(nil)
+
 // NewTracingStore returns a Store wrapper that records spans for the common
 // persistence and lookup operations used by the API and ingester.
 func NewTracingStore(base Store, tracer trace.Tracer) Store {
@@ -27,10 +33,25 @@ func NewTracingStore(base Store, tracer trace.Tracer) Store {
 	return &TracingStore{Store: base, tracer: tracer}
 }
 
+func (s *TracingStore) startSpan(ctx context.Context, op string, extra ...attribute.KeyValue) (context.Context, trace.Span) {
+	ctx, span := s.tracer.Start(ctx, op)
+	attr := AttributionFromContext(ctx)
+	if attr.Originator != "" && attr.Originator != "unknown" {
+		span.SetAttributes(
+			attribute.String("store.originator", attr.Originator),
+			attribute.String("store.tenant", attr.Tenant),
+			attribute.String("db.statement.comment", FormatSQLComment(ctx, op)),
+		)
+	}
+	if len(extra) > 0 {
+		span.SetAttributes(extra...)
+	}
+	return ctx, span
+}
+
 func (s *TracingStore) UpsertEvents(ctx context.Context, events []Event) (int64, error) {
-	ctx, span := s.tracer.Start(ctx, "store.UpsertEvents")
+	ctx, span := s.startSpan(ctx, "store.UpsertEvents", attribute.Int("store.event_count", len(events)))
 	defer span.End()
-	span.SetAttributes(attribute.Int("store.event_count", len(events)))
 	inserted, err := s.Store.UpsertEvents(ctx, events)
 	if err != nil {
 		span.RecordError(err)
@@ -40,9 +61,12 @@ func (s *TracingStore) UpsertEvents(ctx context.Context, events []Event) (int64,
 }
 
 func (s *TracingStore) ReplaceEventsInRange(ctx context.Context, events []Event, fromLedger, toLedger int64) error {
-	ctx, span := s.tracer.Start(ctx, "store.ReplaceEventsInRange")
+	ctx, span := s.startSpan(ctx, "store.ReplaceEventsInRange",
+		attribute.Int64("store.from_ledger", fromLedger),
+		attribute.Int64("store.to_ledger", toLedger),
+		attribute.Int("store.event_count", len(events)),
+	)
 	defer span.End()
-	span.SetAttributes(attribute.Int64("store.from_ledger", fromLedger), attribute.Int64("store.to_ledger", toLedger), attribute.Int("store.event_count", len(events)))
 	err := s.Store.ReplaceEventsInRange(ctx, events, fromLedger, toLedger)
 	if err != nil {
 		span.RecordError(err)
@@ -52,9 +76,8 @@ func (s *TracingStore) ReplaceEventsInRange(ctx context.Context, events []Event,
 }
 
 func (s *TracingStore) GetEvent(ctx context.Context, id string, sc Scope) (Event, error) {
-	ctx, span := s.tracer.Start(ctx, "store.GetEvent")
+	ctx, span := s.startSpan(ctx, "store.GetEvent", attribute.String("store.event_id", id))
 	defer span.End()
-	span.SetAttributes(attribute.String("store.event_id", id))
 	event, err := s.Store.GetEvent(ctx, id, sc)
 	if err != nil {
 		span.RecordError(err)
@@ -64,9 +87,8 @@ func (s *TracingStore) GetEvent(ctx context.Context, id string, sc Scope) (Event
 }
 
 func (s *TracingStore) EventExists(ctx context.Context, id string, sc Scope) (bool, error) {
-	ctx, span := s.tracer.Start(ctx, "store.EventExists")
+	ctx, span := s.startSpan(ctx, "store.EventExists", attribute.String("store.event_id", id))
 	defer span.End()
-	span.SetAttributes(attribute.String("store.event_id", id))
 	exists, err := s.Store.EventExists(ctx, id, sc)
 	if err != nil {
 		span.RecordError(err)
@@ -76,9 +98,11 @@ func (s *TracingStore) EventExists(ctx context.Context, id string, sc Scope) (bo
 }
 
 func (s *TracingStore) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
-	ctx, span := s.tracer.Start(ctx, "store.QueryEvents")
+	ctx, span := s.startSpan(ctx, "store.QueryEvents",
+		attribute.String("store.contract_id", f.ContractID),
+		attribute.String("store.types", fmt.Sprint(f.Types)),
+	)
 	defer span.End()
-	span.SetAttributes(attribute.String("store.contract_id", f.ContractID), attribute.String("store.types", fmt.Sprint(f.Types)))
 	events, cursor, err := s.Store.QueryEvents(ctx, f)
 	if err != nil {
 		span.RecordError(err)
@@ -90,7 +114,7 @@ func (s *TracingStore) QueryEvents(ctx context.Context, f EventFilter) ([]Event,
 }
 
 func (s *TracingStore) GetIngestionState(ctx context.Context) (IngestionState, error) {
-	ctx, span := s.tracer.Start(ctx, "store.GetIngestionState")
+	ctx, span := s.startSpan(ctx, "store.GetIngestionState")
 	defer span.End()
 	state, err := s.Store.GetIngestionState(ctx)
 	if err != nil {
@@ -100,10 +124,37 @@ func (s *TracingStore) GetIngestionState(ctx context.Context) (IngestionState, e
 	return state, err
 }
 
-func (s *TracingStore) SaveIngestionState(ctx context.Context, state IngestionState) error {
-	ctx, span := s.tracer.Start(ctx, "store.SaveIngestionState")
+func (s *TracingStore) GetIngestionStateForNetwork(ctx context.Context, network string) (IngestionState, error) {
+	ctx, span := s.startSpan(ctx, "store.GetIngestionStateForNetwork", attribute.String("store.network", network))
 	defer span.End()
-	span.SetAttributes(attribute.Int64("store.last_ingested_ledger", state.LastIngestedLedger))
+	if r, ok := s.Store.(interface {
+		GetIngestionStateForNetwork(context.Context, string) (IngestionState, error)
+	}); ok {
+		state, err := r.GetIngestionStateForNetwork(ctx, network)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		return state, err
+	}
+	if defaultNetwork(network) == "default" {
+		state, err := s.Store.GetIngestionState(ctx)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		return state, err
+	}
+	// A store without the optional method only knows the default network, so
+	// this is a real lookup failure and belongs on the span like any other.
+	span.RecordError(ErrNotFound)
+	span.SetStatus(codes.Error, ErrNotFound.Error())
+	return IngestionState{}, ErrNotFound
+}
+
+func (s *TracingStore) SaveIngestionState(ctx context.Context, state IngestionState) error {
+	ctx, span := s.startSpan(ctx, "store.SaveIngestionState", attribute.Int64("store.last_ingested_ledger", state.LastIngestedLedger))
+	defer span.End()
 	err := s.Store.SaveIngestionState(ctx, state)
 	if err != nil {
 		span.RecordError(err)

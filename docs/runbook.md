@@ -11,19 +11,80 @@ database, API and replay errors by their text.
 
 ## Table of Contents
 
+- [Pre-deployment preflight self-check](#pre-deployment-preflight-self-check)
 - [Quick health check](#quick-health-check)
 - [Ingestion stalled](#ingestion-stalled)
 - [Dead-letter / error log filling up](#dead-letter--error-log-filling-up)
 - [Audit findings piling up](#audit-findings-piling-up)
 - [Dirty migration recovery](#dirty-migration-recovery)
+- [Live-database schema migrations](#live-database-schema-migrations)
 - [Poisoned event](#poisoned-event)
 - [API returning stale or missing data](#api-returning-stale-or-missing-data)
 - [Database connection exhaustion](#database-connection-exhaustion)
 - [RPC rate limiting / 429 errors](#rpc-rate-limiting--429-errors)
 - [Gap in ingested data (retention window missed)](#gap-in-ingested-data-retention-window-missed)
+- [Bulk event deletion (`DELETE /events`)](#bulk-event-deletion-delete-events)
+- [Mutual TLS (mTLS) and certificate rotation](#mutual-tls-mtls-and-certificate-rotation)
 - [Backup and restore](#backup-and-restore)
 - [Useful queries](#useful-queries)
 - [Configuration reference](#configuration-reference)
+
+---
+
+## Degraded mode when the database is unavailable (`#1282`)
+
+When PostgreSQL is unreachable or failing consecutively, SoroTrail enters a defined degraded mode governed by `store.StoreBreaker`:
+
+### 1. Endpoint posture during a database outage
+
+| Endpoint | Status in degraded mode | Touches database? | Notes |
+|---|---|---|---|
+| `GET /livez` | `200 OK` | **Never** | Liveness stays green so Kubernetes does not restart healthy processes during an external database outage. |
+| `GET /version` | `200 OK` | **Never** | Returns compiled-in build version and commit metadata. |
+| `GET /openapi.json`, `GET /docs` | `200 OK` | **Never** | Serves embedded OpenAPI specification and Swagger UI. |
+| `GET /metrics` | `200 OK` | **Never** | Exports Prometheus metrics, including `sorotrail_db_circuit_breaker_state` and `sorotrail_db_degraded_rejections_total`. |
+| `GET /readyz`, `GET /health` | `503 Service Unavailable` | Probe only | Removes the replica from load-balancer rotation while reporting per-dependency status. |
+| Store-backed reads & writes (`/events`, `/contracts`, `/stats`, etc.) | `503 Service Unavailable` + `Retry-After` | **Fails fast while circuit is open** | Rejects immediately without queueing or waiting for the 25s query timeout. |
+
+### 2. Recovery & anti-stampede backoff
+
+- After `FailureThreshold` (default `3`) consecutive database failures, the breaker opens for `BaseCooldown` (`2s`, doubling up to `30s` with random jitter).
+- While open, requests fail immediately with a jittered `Retry-After` header so retrying clients spread out instead of synchronising.
+- Once the cooldown expires, a single half-open probe request is allowed through; if it succeeds, the circuit closes and normal traffic resumes.
+- The ingester never advances its cursor on a failed store write and backs off with jittered exponential delay.
+- State transitions (`closed -> open`, `open -> half-open`, `half-open -> closed`) are logged once per transition via `OnStateChange` to prevent per-request log floods.
+
+---
+
+## Pre-deployment preflight self-check
+
+Run `sorotrail preflight` before rolling out a new version or as a Kubernetes
+`initContainer` to verify that configuration, credentials, network reachability,
+and remote state are coherent before starting the indexer:
+
+```sh
+# Run all startup self-checks (human-readable table).
+sorotrail preflight
+
+# Emit machine-readable JSON for CI/CD gates or initContainers.
+sorotrail preflight --json
+
+# Run only a subset of checks when staging dependencies incrementally.
+sorotrail preflight --check config,database,rpc --timeout 5s
+
+# Allow pending migrations when the runtime role will apply them on startup.
+sorotrail preflight --allow-pending-migrations
+```
+
+`sorotrail preflight` validates:
+- **`config`**: runs the full startup configuration validator and checks relative `START_LEDGER` syntax with all secrets redacted.
+- **`database`**: connects and pings the configured PostgreSQL or SQLite backend.
+- **`migrations`**: inspects `schema_migrations` without mutating the database, catching dirty schemas, unapplied migrations, or missing `CREATE` privileges on the target schema.
+- **`rpc`**: probes each configured Soroban RPC endpoint (`getNetwork` and `getHealth`), verifying that the node's network passphrase matches `NETWORK` (`testnet`, `mainnet`, `futurenet`) and that `START_LEDGER` falls within the node's retention window.
+- **`archive`**: when `ARCHIVE_BUCKET` is set, verifies S3 bucket reachability and write/delete permissions using a temporary probe object (or read-only with `--read-only`).
+- **`retention`**: verifies coherence between `RETENTION_*` and `ARCHIVE_*` settings so pruning cannot delete unarchived events.
+
+Exit codes: `0` when all selected checks pass, `1` when any dependency check fails, and `2` on configuration validation or CLI flag errors.
 
 ---
 
@@ -45,9 +106,14 @@ docker compose logs --tail 50 sorotrail
 psql "$DATABASE_URL" -c "SELECT 1"
 ```
 
-The `/health` endpoint returns `{"status":"ok"}` when both the database and
-RPC are reachable. A `503` with `"degraded"` tells you which dependency
-failed. The `/stats` endpoint shows `last_ingested_ledger`,
+The `/health` endpoint reports each dependency individually: every entry in
+`checks` carries a `status` (`ok`, `degraded` or `unready`) plus a `detail`
+explaining any non-ok status. A `503` names the failing dependency — and
+whether it is unreachable (`unready`) or reachable-but-unhealthy
+(`degraded`) — so you don't need the logs to see which one broke.
+`/readyz` answers the same envelope with an added `ingestion_lag` check
+(degraded beyond 100 ledgers behind the chain head); `/livez` never touches
+a dependency. The `/stats` endpoint shows `last_ingested_ledger`,
 `verified_through_ledger`, and audit counters — the three numbers that
 tell you whether the system is making progress and whether the auditor is
 happy.
@@ -261,6 +327,69 @@ in production).
 
 ---
 
+## Live-database schema migrations
+
+SoroTrail enforces live-database DDL safety rules via `store.LintEmbeddedMigrations`
+(`TestMigrate_LiveDatabaseSafetyRules`) and applies bounded session lock/statement
+timeouts (`DefaultMigrationLockTimeout = 5s`, `DefaultMigrationStatementTimeout = 30s`)
+on every migration connection so schema upgrades do not stall live ingestion or
+API reads during rolling deployments.
+
+### Allowed vs. forbidden DDL operations on live tables
+
+| Operation | Live-DB Impact | Policy & CI Rule |
+| --- | --- | --- |
+| `CREATE TABLE IF NOT EXISTS ...` + `CREATE INDEX ...` on that same new table | Safe (new empty table has no live traffic) | Allowed |
+| `CREATE [UNIQUE] INDEX` on an existing table without `CONCURRENTLY` | Acquires `SHARE` lock, blocking all `INSERT`/`UPDATE`/`DELETE` traffic for the full scan | **Forbidden** (`concurrent-index-required`). Use `CREATE INDEX CONCURRENTLY IF NOT EXISTS` with `-- sorotrail:no-transaction` (or `-- sorotrail:allow-partitioned-parent-index:` when defining metadata on partitioned parent `events`). |
+| `CREATE/DROP INDEX CONCURRENTLY` inside a transaction or without `-- sorotrail:no-transaction` | Fails in PostgreSQL (`cannot run inside a transaction block`) | **Forbidden** (`concurrent-index-no-tx`). Add `-- sorotrail:no-transaction` at the top of the `.sql` file and omit `BEGIN`/`COMMIT`. |
+| `ALTER TABLE ... ADD COLUMN` (nullable, or `NOT NULL` with a constant `DEFAULT`) | Fast metadata-only catalog update in PostgreSQL 11+ | Allowed |
+| `ALTER TABLE ... ADD COLUMN ... NOT NULL` without `DEFAULT` | Fails on non-empty tables or forces an `ACCESS EXCLUSIVE` scan | **Forbidden** (`not-null-needs-default`). Add the column as nullable or with a constant `DEFAULT`. |
+| `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` directly | Scans the entire table under `ACCESS EXCLUSIVE` | **Forbidden** (`not-null-needs-default`). First add `CHECK (col IS NOT NULL) NOT VALID`, then `VALIDATE CONSTRAINT` (`SHARE UPDATE EXCLUSIVE`), then `SET NOT NULL`. |
+| `ALTER TABLE ... DROP COLUMN` | Breaks running instances from the previous release that still `SELECT` or `INSERT` the column | **Forbidden** (`no-drop-column`) until Stage 5 of expand-and-contract (`-- sorotrail:allow-contract-drop-column: <reason>`). |
+| `ALTER TABLE ... RENAME COLUMN` / `RENAME TO` | Immediately breaks live instances referencing the old name | **Forbidden** (`no-rename-column-or-table`). Use the 5-stage expand-and-contract pattern. |
+| `ALTER TABLE ... ALTER COLUMN ... TYPE` | Rewrites the entire table under `ACCESS EXCLUSIVE` lock | **Forbidden** (`no-alter-column-type`). Use the 5-stage expand-and-contract pattern. |
+| Unbounded `UPDATE` / `DELETE` / `INSERT INTO ... SELECT` in `.up.sql` | Holds row locks across the whole table and hits `statement_timeout` | **Forbidden** (`no-unbounded-data-backfill`). Use `store.RunBatchedMigration` with cursor checkpointing in `migration_backfill_state`. |
+
+### 5-stage expand-and-contract rollout pattern
+
+Any breaking column change (rename, type change, format migration, or column removal) must be rolled out across releases in five non-blocking stages:
+
+1. **Stage 1 — Expand (DDL)**: Add the new nullable column (and any `CREATE INDEX CONCURRENTLY` with `-- sorotrail:no-transaction`). Existing instances ignore the new column.
+2. **Stage 2 — Dual-write (App)**: Deploy application code that writes to both the old and new columns while continuing to read from the old column (falling back to the new column if needed).
+3. **Stage 3 — Resumable batched backfill (`store.RunBatchedMigration`)**: Backfill historical rows in bounded transactions (`DefaultBatchedMigrationSize = 1000`). Each batch commits its high-water cursor to `migration_backfill_state` and logs structured progress (`"batched migration progress"` with `migration_name`, `batch`, `batch_rows`, `total_rows`, `cursor`, `completed`, `elapsed_ms`). If interrupted by a timeout or restart, re-running `RunBatchedMigration` resumes from `last_cursor`.
+4. **Stage 4 — Switch reads & validate (App + DDL)**: Deploy application code that reads exclusively from the new column and stops writing the old column. If `NOT NULL` is required on the new column, add `CHECK (new_col IS NOT NULL) NOT VALID` followed by `VALIDATE CONSTRAINT`.
+5. **Stage 5 — Contract (DDL)**: Once no running instance references the old column, drop it in a dedicated migration annotated with `-- sorotrail:allow-contract-drop-column: <reason>`.
+
+### Safely aborting a blocked migration or invalid `CONCURRENTLY` index
+
+If a migration statement waits longer than `DefaultMigrationLockTimeout` (`5s`) for a lock or exceeds `DefaultMigrationStatementTimeout` (`30s`), PostgreSQL aborts the statement automatically. If you need to cancel an in-flight migration manually or clean up a failed `CREATE INDEX CONCURRENTLY`:
+
+```sh
+# 1. Inspect active migration or index-build queries and lock waits.
+psql "$DATABASE_URL" -c "
+  SELECT pid, state, wait_event_type, wait_event, now() - query_start AS duration, query
+  FROM pg_stat_activity
+  WHERE datname = current_database()
+    AND state != 'idle'
+  ORDER BY query_start"
+
+# 2. Gracefully cancel the blocked migration query (never use pg_terminate_backend first).
+psql "$DATABASE_URL" -c "SELECT pg_cancel_backend(<pid>)"
+
+# 3. Check for any INVALID index left behind by an interrupted CREATE INDEX CONCURRENTLY.
+psql "$DATABASE_URL" -c "
+  SELECT c.relname AS index_name, i.indisvalid
+  FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE NOT i.indisvalid"
+
+# 4. Drop the invalid index non-blockingly and clear the dirty flag before retrying.
+psql "$DATABASE_URL" -c "DROP INDEX CONCURRENTLY IF EXISTS <index_name>"
+psql "$DATABASE_URL" -c "UPDATE schema_migrations SET dirty = false WHERE dirty = true"
+```
+
+---
+
 ## Poisoned event
 
 A "poisoned" event is one whose XDR cannot be decoded, causing the decoder
@@ -444,57 +573,374 @@ to error.
 
 ---
 
+## Bulk event deletion (`DELETE /events`)
+
+`DELETE /events` is the manual, admin-only bulk delete. It is the only API
+surface that removes stored events outside the retention pruner, and it
+deliberately does not inherit the pruner's safeguards. Use it for a one-off
+correction, not as a retention policy: the pruner is batched, scheduled,
+bounded by `last_ingested_ledger`, optionally archived, and reports metrics.
+
+### What it deletes
+
+`DELETE /events?before_ledger=N` runs one SQL statement:
+
+```sql
+DELETE FROM events WHERE ledger < N;
+```
+
+Consequences:
+
+- The bound is **exclusive**: ledger `N-1` is deleted, ledger `N` is kept.
+- The delete is **instance-wide**. The statement has no `network` predicate,
+  so it removes the range on every network stored in the database, not only
+  the server's configured `NETWORK`.
+- It is **one unbatched statement**, with no `LIMIT`, no dry run, and no
+  `last_ingested_ledger` guard. A bound above the chain head deletes every
+  stored event. A large range can hold locks and grow WAL for a long time.
+- It removes only rows from `events`. On Postgres, `event_addresses` has no
+  foreign key to `events`, so those index rows survive; address endpoints
+  join `events`, so they will not return the deleted events, but the index
+  entries are not reclaimed here. `token_balances`, `contract_meta`,
+  `archive_chunks`, subscriptions, and delivery history are also untouched.
+- It does not reset `ingestion_state`, `contract_cursors`, `backfill_state`,
+  or `audit_state`.
+
+### Authentication, parameters and response
+
+The route is gated by the static `API_KEY`, not by the tenant API-key
+system. `X-API-Key` must match `API_KEY` byte-for-byte; an
+`Authorization: Bearer ...` key minted by `/apikeys` is not accepted here.
+When `API_KEY` is unset the endpoint is closed and every request gets `503`
+rather than running unauthenticated.
+
+| Input / outcome | Behaviour |
+| --- | --- |
+| `before_ledger` | Required. Positive integer. Exclusive: `ledger < before_ledger`. There is no maximum, so validate it before sending. |
+| success | `200 {"deleted": N}`. `N` is the number of rows the statement removed; an empty range returns `0`. `Cache-Control: no-store`. |
+| missing or invalid `before_ledger` | `400` with the parse error. |
+| missing or wrong key | `401 invalid or missing X-API-Key header`. |
+| no `API_KEY` configured | `503 API_KEY env var must be set ...`. |
+| store failure | `500 deleting events failed`. |
+
+On ClickHouse the delete is an asynchronous `ALTER TABLE ... DELETE`
+mutation; the response count is a snapshot taken before the mutation, so
+rows can remain visible briefly. Postgres and SQLite delete synchronously.
+
+```sh
+curl -sS -X DELETE \
+  -H "X-API-Key: $API_KEY" \
+  "$SOROTRAIL_URL/events?before_ledger=250000"
+```
+
+### What it cannot undo
+
+**There is no undo.** The endpoint returns only a count, not the deleted
+IDs, and it does not write a backup. Recovery is limited to what still
+exists in the RPC, the archive, or your own export.
+
+- **RPC retention.** Stellar RPC serves only the most recent
+  `ledgerRetentionWindow` ledgers (roughly 24h-7d). Check the live window
+  with:
+
+  ```sh
+  curl -sS -X POST "$RPC_URL" \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+    | jq '{oldestLedger: .result.oldestLedger, latestLedger: .result.latestLedger, ledgerRetentionWindow: .result.ledgerRetentionWindow}'
+  ```
+
+  If `before_ledger - 1 < oldestLedger`, part or all of the range is
+  already outside the RPC's retention window. Those rows cannot be
+  re-ingested; export them before deleting.
+
+- **Archive.** The endpoint never archives. The pruner's archive path is
+  separate: with `ARCHIVE_BUCKET` and `ARCHIVE_BEFORE_PRUNE=true`, the
+  pruner writes the range to `<prefix>/events/schema=1/ledger_start=.../`
+  as `data.ndjson.gz` plus `manifest.json` before deleting it. The bulk
+  endpoint bypasses that path, so a range can be deleted without ever being
+  archived.
+
+  Check the bucket, not `archive_chunks`: the current archiver writes
+  objects but does not populate the `archive_chunks` table (see the status
+  note in [archival.md](archival.md)). A manifest whose `chunk.ledger_end`
+  is greater than `before_ledger` covers the range. Archived objects are
+  never removed by this endpoint.
+
+- **Audit.** The auditor is forward-only. It verifies from
+  `verified_through_ledger + 1` toward the ingest frontier and never
+  revisits a lower ledger. Therefore:
+
+  - A delete at or below `verified_through_ledger` is invisible to the
+    auditor and stays deleted.
+  - A delete above the high-water mark, while the RPC still retains the
+    range, looks like missing data: the auditor opens a finding and
+    re-ingests the range, restoring exactly the events just deleted.
+  - Once the range has aged out of the RPC, the auditor cannot restore it;
+    findings in that range can end up `unverifiable` or `unrecoverable`.
+
+  If you need a deletion above `verified_through_ledger` to stick, keep the
+  auditor disabled for the operation; re-enabling it with the old
+  high-water mark will trigger a repair. The simplest safe rule is to
+  delete only at or below the high-water mark. When `AUDIT_ENABLED=false`,
+  `verified_through_ledger` stays `0`, so there is no auditor to undo the
+  delete and this check does not apply.
+
+- **Backfill.** `backfill_state` and `contract_cursors` are untouched. A
+  backfill that is still running resumes from
+  `backfill_state.last_ledger + 1` and will re-insert any deleted ledgers
+  above that point as it advances. A completed backfill will not replay
+  them. Deleting rows does not reset either cursor.
+
+- **Live subscribers.** Neither the WebSocket stream nor webhook
+  subscriptions receive a delete or tombstone event. They only see newly
+  ingested events at delivery time, and neither has server-side replay;
+  clients implement the catch-up pattern by querying `/events`, which also
+  stops returning the deleted rows. A delivery already queued in memory may
+  still arrive after the delete, and historical `delivery_attempts` rows
+  remain.
+
+- **HTTP caches.** `GET /events/{id}` is served with
+  `Cache-Control: public, max-age=31536000, immutable`. A CDN or browser
+  that cached a deleted event can keep serving it for up to a year even
+  though the API now returns `404`. Purge the CDN/proxy cache after the
+  delete if the event must disappear immediately.
+
+### Safe procedure
+
+1. **Pick the bound and record the current state.**
+
+   ```sh
+   BOUND=250000
+
+   psql "$DATABASE_URL" <<SQL
+   SELECT count(*) AS events_below_bound FROM events WHERE ledger < $BOUND;
+   SELECT coalesce(max(last_ingested_ledger), 0) AS last_ingested
+     FROM ingestion_state;
+   SELECT network, verified_through_ledger FROM audit_state ORDER BY network;
+   SELECT contract_id, from_ledger, to_ledger, last_ledger, completed_at
+     FROM backfill_state;
+   SQL
+   ```
+
+   If `events_below_bound` is `0`, there is nothing to delete. If a
+   backfill is not complete and `last_ledger < BOUND - 1`, it can restore
+   part of the range; stop it first or account for that.
+
+2. **Confirm the RPC and archive cannot cover the range.** Run the
+   `getHealth` check above. If `BOUND - 1 < oldestLedger` and no archive
+   manifest covers the range, this delete is permanent. Export first.
+
+3. **Export the exact range and verify the export.**
+
+   ```sh
+   curl -sG "$SOROTRAIL_URL/events" \
+     --data-urlencode "stream=true" \
+     --data-urlencode "include_xdr=true" \
+     --data-urlencode "from_ledger=1" \
+     --data-urlencode "to_ledger=$((BOUND - 1))" \
+     -o "events-before-$BOUND.ndjson"
+
+   EXPECTED=$(curl -sG "$SOROTRAIL_URL/events/count" \
+     --data-urlencode "to_ledger=$((BOUND - 1))" | jq -r .count)
+   test "$(wc -l < "events-before-$BOUND.ndjson")" -eq "$EXPECTED"
+   sha256sum "events-before-$BOUND.ndjson"
+   ```
+
+   `include_xdr=true` keeps the raw topic/value XDR needed by
+   `sorotrail replay`; without it the export is only the decoded JSON.
+   Store the file somewhere durable before continuing. `/events` is
+   streamed, so it has no page limit, but the whole range must fit on disk
+   and the request lasts as long as the scan.
+
+4. **Make the delete auditable.** Only proceed when
+   `BOUND - 1 <= verified_through_ledger` for every network you are
+   deleting from. If that is not true, either wait for the auditor to
+   verify through the range or keep the auditor disabled for the whole
+   operation (see above).
+
+5. **Delete.**
+
+   ```sh
+   curl -sS -X DELETE \
+     -H "X-API-Key: $API_KEY" \
+     "$SOROTRAIL_URL/events?before_ledger=$BOUND" \
+     | tee "delete-$BOUND.json"
+   ```
+
+6. **Verify the range is gone and nothing was re-ingested.**
+
+   ```sh
+   curl -sG "$SOROTRAIL_URL/events/count" \
+     --data-urlencode "to_ledger=$((BOUND - 1))"
+   # {"count":0}
+
+   curl -s "$SOROTRAIL_URL/stats" \
+     | jq '{total_events, oldest_stored_ledger, verified_through_ledger, last_ingested_ledger}'
+   ```
+
+   The count must be `0`. `oldest_stored_ledger` should move forward (or
+   become `0` if the table is empty). Check `audit_findings` for a new
+   finding over the range; if one appears, the auditor is re-fetching it.
+   Then purge any CDN or browser cache for the deleted event URLs.
+
+7. **Keep the export.** The NDJSON file and its checksum are the only
+   recovery path once the RPC has aged out the range; keep them for at
+   least as long as the deleted data matters.
+
+---
+
+## Mutual TLS (mTLS) and certificate rotation
+
+SoroTrail supports mutual TLS (mTLS) on the inbound HTTP API as well as on
+outbound connections to PostgreSQL and S3-compatible object storage. All
+certificate pairs are loaded through `config.CertReloader` (`GetCertificate` /
+`GetClientCertificate`), so certs mounted by SPIFFE/SPIRE or `cert-manager`
+rotate live on disk without restarting the process.
+
+### Inbound HTTP API mTLS
+
+Enable inbound mTLS by setting:
+
+- `MTLS_ENABLED=true`
+- `TLS_CERT_FILE=/path/to/tls.crt`
+- `TLS_KEY_FILE=/path/to/tls.key`
+- `TLS_CLIENT_CA_FILE=/path/to/ca.crt`
+- `TLS_CLIENT_ALLOWED_IDENTITIES=spiffe://cluster.local/ns/default/sa/gateway,api-client` _(optional comma-separated allowlist of client certificate `Subject.CommonName`, DNS SANs, or URI SANs)_
+- `TLS_CLIENT_TENANT_MAP=spiffe://cluster.local/ns/default/sa/gateway=tenant-a,api-client=tenant-b` _(optional identity-to-tenant mapping)_
+
+**Defence-in-depth with API keys:**
+
+- When `MTLS_ENABLED=true` and `API_KEY` (or a managed `Bearer` API key) is configured, **both** checks must succeed: the TLS listener requires and verifies the client certificate against `TLS_CLIENT_CA_FILE`, the HTTP middleware enforces `TLS_CLIENT_ALLOWED_IDENTITIES`, and the request must still present a valid API key unless `TLS_CLIENT_TENANT_MAP` maps the verified client certificate identity directly to a `TenantContext` (and `API_KEY` is unset).
+- If `TLS_CLIENT_TENANT_MAP` is configured alongside `API_KEY` or a `Bearer` token, the client certificate must match the tenant mapping **and** the API key must authenticate.
+
+### Outbound PostgreSQL and Archive mTLS
+
+- **PostgreSQL (`DB_TLS_CERT_FILE`, `DB_TLS_KEY_FILE`, `DB_TLS_CA_FILE`)**: Configures `pgxpool` with a live-reloading `tls.Config` (`GetClientCertificate`). Explicit `DB_TLS_*` variables take precedence over `sslcert`, `sslkey`, and `sslrootcert` query parameters in `DATABASE_URL`.
+- **Archive S3 (`ARCHIVE_TLS_CERT_FILE`, `ARCHIVE_TLS_KEY_FILE`, `ARCHIVE_TLS_CA_FILE`)**: Configures the S3 archive HTTP transport with a live-reloading `tls.Config` (`GetClientCertificate`) and optional custom root CA bundle.
+
+### Certificate expiry monitoring (`sorotrail_tls_certificate_expiry_days`)
+
+SoroTrail exports the `sorotrail_tls_certificate_expiry_days` gauge labelled by `component` (`http_server`, `database_client`, `archive_client`). It is updated automatically whenever a certificate is loaded or rotated on disk.
+
+Recommended Prometheus alert rule:
+
+```yaml
+- alert: SoroTrailTLSCertificateExpiringSoon
+  expr: sorotrail_tls_certificate_expiry_days < 7
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: "SoroTrail TLS certificate for {{ $labels.component }} expires in less than 7 days"
+```
+
+If a certificate reload fails transiently (for example while Kubernetes updates a Secret symlink), `CertReloader` logs a warning and continues serving the last valid in-memory keypair until both files are readable and match.
+
+---
+
 ## Backup and restore
 
-### What to back up
+### Irreplaceable vs. reconstructible state
 
-SoroTrail's only persistent state is the Postgres database. There are no
-files on disk that matter (the binary is stateless, cursors and progress
-are in the database).
+SoroTrail separates **irreplaceable operator configuration and checkpoints** (which do not exist on-chain and must be backed up) from **reconstructible chain events** (which can be re-indexed from Stellar RPC or ledger archives via `sorotrail backfill`, or optionally included in a full snapshot via `--include-events`):
 
-### Backup procedure
+| Table | Category | Backed up by default (`sorotrail backup`) | Recovery method |
+| --- | --- | --- | --- |
+| `watched_contracts` | **Irreplaceable** | Yes | Restored from backup; operator watch list does not exist on-chain. |
+| `contract_cursors` | **Irreplaceable** | Yes | Restored from backup; per-contract ingestion resume checkpoints. |
+| `ingestion_state` | **Irreplaceable** | Yes | Restored from backup; per-network global ingestion checkpoint (`last_ingested_ledger`, `last_cursor`, `last_successful_poll`). |
+| `audit_state` | **Irreplaceable** | Yes | Restored from backup; gap-audit watermark (`verified_through_ledger`). |
+| `audit_findings` | **Irreplaceable** | Yes | Restored from backup; historical gap-audit findings and repair status. |
+| `replay_state` | **Irreplaceable** | Yes | Restored from backup; in-progress decoder replay checkpoint. |
+| `backfill_state` | **Irreplaceable** | Yes | Restored from backup; parallel backfill range checkpoints (`ranges_json`). |
+| `subscriptions` | **Irreplaceable** | Yes | Restored from backup; webhook callback URLs, filters, and HMAC secrets. |
+| `api_keys` | **Irreplaceable** | Yes | Restored from backup; operator API key prefixes, bcrypt hashes, and revocation timestamps. |
+| `tenants`, `tenant_contract_grants`, `tenant_watched_contracts`, `tenant_api_keys` | **Irreplaceable** | Yes | Restored from backup; multi-tenant definitions, rate-limit quotas, ACL grants, and SHA-256 key hashes. |
+| `contract_specs` | **Irreplaceable** | Yes | Restored from backup; cached contract WASM specs. |
+| `contract_spec_overrides` | **Irreplaceable** | Yes | Restored from backup; operator-uploaded custom contract event specs. |
+| `contract_spec_override_history` | **Irreplaceable** | Yes | Restored from backup; immutable audit trail of spec override changes. |
+| `events` | **Reconstructible** | Optional (`--include-events`) | Re-indexed from Stellar RPC / ledger archives via `sorotrail backfill --from <min> --to <max>`, or included in full snapshots via `--include-events`. Even when omitted, `event_summary` (`total_count`, `min_ledger`, `max_ledger`, `per_contract_counts`) is always recorded in the backup manifest. |
+| `delivery_attempts` | **Reconstructible / Transient** | No | Transient webhook delivery telemetry; not required for resume correctness. |
+
+### Backup procedure (`sorotrail backup` & `pg_dump`)
+
+#### 1. Application-level portable backup (`sorotrail backup`)
+
+`sorotrail backup` produces a self-describing, SHA-256 integrity-verified JSON archive across both PostgreSQL and SQLite backends:
 
 ```sh
-# Full logical backup (recommended for small-to-medium databases).
-pg_dump "$DATABASE_URL" > sorotrail-backup-$(date +%Y%m%d-%H%M%S).sql
+# Fast configuration + checkpoint backup (recommended for frequent cron snapshots;
+# omits reconstructible chain events while recording event_summary bounds):
+sorotrail backup \
+  --output "sorotrail-config-$(date +%Y%m%d-%H%M%S).json" \
+  --secrets encrypt \
+  --passphrase "$SOROTRAIL_BACKUP_PASSPHRASE"
 
-# Or compressed:
-pg_dump "$DATABASE_URL" | gzip > sorotrail-backup-$(date +%Y%m%d-%H%M%S).sql.gz
+# Self-contained full backup (includes all stored chain events):
+sorotrail backup \
+  --output "sorotrail-full-$(date +%Y%m%d-%H%M%S).json" \
+  --include-events \
+  --secrets encrypt \
+  --passphrase "$SOROTRAIL_BACKUP_PASSPHRASE"
 ```
 
-For large databases, use `pg_basebackup` or your cloud provider's snapshot
-feature.
+#### 2. Native PostgreSQL physical/logical backup (`pg_dump`)
 
-### When to back up
-
-- Before upgrading the binary (migrations run automatically on startup).
-- Before changing `WATCHED_CONTRACTS` or `START_LEDGER`.
-- Periodically if you want point-in-time recovery.
-
-### Restore procedure
+For large multi-gigabyte PostgreSQL deployments where full event partitions are snapshotted alongside configuration:
 
 ```sh
-# Restore from a logical backup.
-# WARNING: this drops and recreates tables. Stop SoroTrail first.
-psql "$DATABASE_URL" < sorotrail-backup-YYYYMMDD-HHMMSS.sql
-
-# Then restart SoroTrail — it will re-run migrations if needed and resume
-# ingestion from the persisted cursor.
+# Custom-format compressed logical dump:
+pg_dump -Fc "$DATABASE_URL" > "sorotrail-backup-$(date +%Y%m%d-%H%M%S).dump"
 ```
 
-### What is NOT in the backup
+### Secret handling (`--secrets include|redact|encrypt`)
 
-- The running process state (cursor, backoff counter). On restart, the
-  ingester resumes from the persisted `ingestion_state` row.
-- Audit state and findings. These are in the database and will be restored.
-- Replay state. Also in the database.
+Webhook signing keys (`subscriptions.secret`) and API key hashes (`api_keys.key_hash`, `tenant_api_keys.key_hash`) are handled explicitly:
 
-### Recovery point objective
+- **`--secrets=encrypt` (recommended for off-host/S3 storage):** Encrypts every secret field with AES-256-GCM using a key derived from `--passphrase` (or `SOROTRAIL_BACKUP_PASSPHRASE`) and a per-archive random 128-bit salt (`encryption_salt`). Restoring requires the matching passphrase; a wrong passphrase fails deterministically before committing any database changes.
+- **`--secrets=redact` (safe for sharing archives in bug reports or staging drills):** Replaces secrets with `"REDACTED"`. On restore, any redacted webhook subscription is automatically inserted with `enabled = false` (`redacted_subscriptions_disabled` in the restore output) so the webhook worker will not sign deliveries with a placeholder secret until an operator rotates the secret and re-enables the subscription.
+- **`--secrets=include` (default for local administrative snapshots):** Writes secrets in plaintext JSON, enforces `0600` (owner read/write only) permissions on the output file, and prints a warning to `stderr`.
 
-SoroTrail's RPO is effectively zero under normal operation — every
-successful RPC page is immediately persisted. If the process crashes between
-pages, at most one page of events (up to 1000 events) needs to be
-re-fetched. Idempotent upserts mean re-fetching never creates duplicates.
+### Restore & post-restore verification procedure (`sorotrail restore`)
+
+`sorotrail restore` verifies the archive's `integrity_sha256` checksum and `schema_version` compatibility before executing a single atomic transaction:
+
+- **Safety guard against accidental overwrite:** `sorotrail restore` refuses to overwrite a database that already contains operator state or events (`restore target database is not empty`) unless `--force` is explicitly passed.
+- **Cross-version migration compatibility:** An archive created under an older migration version (`archive.schema_version <= target.schema_version`) restores cleanly into a newer schema, automatically populating defaults (such as `network = 'default'`) for columns added in later migrations. An archive from a newer schema than the target database is rejected (`ErrBackupNewerSchema`) until `sorotrail migrate up` is run.
+
+```sh
+# 1. Apply all migrations to the fresh target database:
+DATABASE_URL="$NEW_DATABASE_URL" sorotrail migrate up
+
+# 2. Restore the archive and run completeness + retention verification (--verify is enabled by default):
+DATABASE_URL="$NEW_DATABASE_URL" sorotrail restore \
+  --input sorotrail-full-YYYYMMDD-HHMMSS.json \
+  --passphrase "$SOROTRAIL_BACKUP_PASSPHRASE" \
+  --verify
+```
+
+When `--verify` is active (the default), `sorotrail restore` re-reads the live database after commit and verifies:
+1. Row counts and primary keys across all 16 irreplaceable tables (`watched_contracts`, `contract_cursors`, `ingestion_state`, `audit_state`, `audit_findings`, `replay_state`, `backfill_state`, `subscriptions`, `api_keys`, `tenants` + grants, `contract_specs`, `contract_spec_overrides`, `contract_spec_override_history`) and `events` (when `--include-events` was used).
+2. Secret round-trip integrity (or disabled status when `--secrets=redact` was used).
+3. Retention and partition consistency (`retention_report`).
+
+### Interaction with event retention and partitioning
+
+- **Restoring a config-only backup (`--include-events=false`):** `sorotrail restore --verify` compares the restored `ingestion_state.last_ingested_ledger` against the snapshot's `event_summary` (`[min_ledger..max_ledger]`), sets `retention_report.backfill_required = true`, and prints the exact `sorotrail backfill --from <min_ledger> --to <max_ledger>` command needed to reconstruct historical chain events (or notes that starting `sorotrail` will resume forward from `last_ingested_ledger`).
+- **Retention floor alignment (`--retention-min-ledger`):** Pass `--retention-min-ledger <N>` when restoring into an instance with active time/ledger pruning (`RETENTION_DAYS`) or detached PostgreSQL range partitions. If the archive's `event_summary.min_ledger` or `audit_state.verified_through_ledger` precedes the retention floor, `sorotrail restore` emits a structured warning so operators know which historical ledger range falls outside the active retention window.
+
+### Measured RPO and RTO (automated DR drill)
+
+The disaster recovery drill is exercised continuously in CI (`TestDisasterRecoveryDrill_FullAndConfigOnlyRestoreWithMeasuredRPORTO` in `internal/store/backup_restore_test.go` and `TestCLIBackupAndRestore_EndToEndDrill` in `cmd/sorotrail/backup_test.go`) against a populated database (3 watched contracts, per-contract cursors, ingestion & audit state, audit findings, replay checkpoint, webhook subscriptions with HMAC secrets, contract WASM specs, spec overrides + history, and 300 events across ledgers `500000..500299`):
+
+| Metric | Config + Checkpoint Backup (`--include-events=false`) | Full Snapshot (`--include-events=true`, 300 events) |
+| --- | --- | --- |
+| **Backup duration** | `~33 ms` | `~64 ms` |
+| **Atomic restore transaction** | `~45 ms` | `~196 ms` |
+| **End-to-end RTO (migrate + restore + verify)** | `~120 ms` | `~352 ms` |
+| **RPO (irreplaceable config & checkpoints)** | **`0` rows lost** | **`0` rows lost** |
+| **RPO (chain events)** | Reconstructible via `sorotrail backfill` from restored cursor | **`0` rows lost** (or at most 1 in-flight RPC page if the process crashed mid-poll) |
 
 ---
 
@@ -602,3 +1048,17 @@ When nothing above resolves the issue:
 4. If the database is corrupted, restore from backup and let SoroTrail
    re-migrate and re-ingest.
 5. Open an issue on the repository with the gathered diagnostics.
+
+## Dashboards and alerts
+
+Dashboards are provisioned from `deploy/grafana/*.json` (versioned, not exported from a live Grafana). Start at the Overview (`/d/sorotrail-overview`), which shows the SLO indicators recorded in `deploy/prometheus/sorotrail-rules.yml`, then follow its links to a focused view:
+
+| Symptom / alert | Dashboard | Section above |
+|---|---|---|
+| `IngestionLagHigh`, `IngestionErrorsBurst`, `RPCP99LatencyHigh` | Ingestion (`/d/sorotrail-ingestion`) | [Ingestion stalled](#ingestion-stalled) |
+| High API latency or 5xx | Read path (`/d/sorotrail-read-path`) | [API returning stale or missing data](#api-returning-stale-or-missing-data) |
+| `StoreWriteLatencyHigh`, `BackpressureActive`, `EventBatchSizeCritical` | Storage (`/d/sorotrail-storage`) | [Database connection exhaustion](#database-connection-exhaustion) |
+
+Every alert carries a `dashboard_url` annotation and every dashboard links back to this runbook. `make check-monitoring` fails if a dashboard references a metric that is not in `deploy/prometheus/exported-metrics.txt`, reads a recording rule that does not exist, reuses a `uid`, has a panel without a "what good looks like" description, or an alert lacks `dashboard_url`.
+
+Not covered yet: there is no per-tenant, webhook-delivery, or retention/archiver dashboard, because SoroTrail exports no per-tenant or delivery metrics to build them from.

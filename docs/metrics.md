@@ -1,0 +1,127 @@
+# Metrics catalogue
+
+Every Prometheus metric SoroTrail exports, in one place: its type, its
+labels, and what the number means. Two registries serve them, both in a
+single scrape of `GET /metrics` (`ENABLE_METRICS=true`):
+
+- the **global registry** — every `sorotrail_*` counter, gauge and
+  histogram, registered when `internal/metrics` is imported, so every
+  process that links the package exports them;
+- the **per-server registry** — `http_request_duration_seconds`, one
+  histogram per `metrics.HTTPMetrics` instance, so tests and parallel
+  servers do not collide on the global one.
+
+A scrape also carries the Prometheus client library's own runtime
+families (`go_*`, `process_*`, `promhttp_*`) — the library's
+instrumentation rather than SoroTrail's, listed here only so nobody
+mistakes them for undocumented project metrics.
+
+This file is generated from the catalogue in
+`internal/metrics/metrics_catalogue_test.go`, which is checked against
+`metrics.go`'s declarations and against what the registries actually
+serve, so a renamed, removed or newly added metric fails the build until
+it is documented. Regenerate it with:
+
+    go test ./internal/metrics -run TestMetricsDocumentation -update-metrics-doc
+
+## Conventions
+
+- Every metric name is lower-case snake_case; global metrics carry the
+  `sorotrail_` prefix (the sole exception, `http_request_duration_seconds`,
+  predates the prefix and is quoted in runbooks, so it is pinned by test
+  rather than renamed).
+- Counters end `_total`; histograms carry their unit (`_seconds`);
+  gauges are plain unit-suffixed names.
+- Labels come from a closed set (see "Label sets") and no label ever
+  carries entity identity: no event id, transaction hash, address,
+  credential or raw path. `route` is the matched chi route pattern (or
+  `unmatched`), so path probes cannot grow cardinality; `provider` is a
+  configured RPC URL's hostname with scheme, credentials, path and query
+  stripped.
+- Histograms use the Prometheus default buckets
+  (`DefBuckets`, 0.005s … 10s), which suit RPC round trips and database
+  writes; the `_count` and `_sum` series every histogram exports are
+  how call totals and mean latency are read without a separate counter.
+
+## Ingestion metrics
+
+| Metric | Type | Labels | Help (as served) | Meaning |
+| --- | --- | --- | --- | --- |
+| `sorotrail_events_ingested_total` | counter | — | Total number of events ingested (including duplicates resolved by idempotent upsert). | Throughput of the ingestion pipeline. Duplicates resolved by the idempotent upsert still count, so this measures pipeline work rather than net-new rows; subtract the store's own counts when net-new is what matters. Also read by the /stats endpoint as the in-process ingest counter. |
+| `sorotrail_ingest_errors_total` | counter | — | Total number of ingestion passes that failed with an error. | Ingestion passes that ended in an error — an RPC failure, a decode failure or a database write failure. Retries are not counted, only passes that ended badly. Registered but not yet incremented by any call site, so it reads 0; it is pinned here so the wiring lands against a documented contract. |
+| `sorotrail_ingestion_lag_ledgers` | gauge | — | Number of ledgers the indexer is behind the chain head. | Chain head minus last ingested ledger, updated after every ingestion pass that knows the chain head. The direct alert for a stalled pipeline: anything above zero for a sustained window means ingestion is falling behind. |
+
+## RPC metrics
+
+| Metric | Type | Labels | Help (as served) | Meaning |
+| --- | --- | --- | --- | --- |
+| `sorotrail_rpc_call_duration_seconds` | histogram | `method` (getEvents \| getLatestLedger \| getHealth \| getLedgerEntries \| simulateTransaction); `outcome` (success \| error) | RPC call latency in seconds (HTTP round trip + body read + parse), labelled by method and outcome. | Latency of a single JSON-RPC call. The histogram's _count for a (method, outcome) pair is that pair's call total, so one metric answers both "how slow" and "how many, and how many failed" — when ingestion falls behind, this says whether the upstream is slow or failing. |
+| `sorotrail_rpc_retries_total` | counter | `method` (getEvents \| getLatestLedger \| getHealth \| getLedgerEntries \| simulateTransaction); `reason` (backoff \| retry_after) | Total number of RPC retry attempts, labelled by method and reason (backoff \| retry_after). | Every retry attempt after the first. reason says where the wait came from: the computed exponential backoff, or a provider-supplied 429 Retry-After hint — a lot of retry_after means the provider is explicitly throttling us. |
+| `sorotrail_rpc_backoff_seconds_total` | counter | `method` (getEvents \| getLatestLedger \| getHealth \| getLedgerEntries \| simulateTransaction) | Total seconds spent sleeping between RPC retries, labelled by method. | Cumulative wall-clock time lost to retry waits. Priced in seconds rather than counts so a long tail is visible: sustained growth means the provider (or our own rate limiter) is throttling us. |
+| `sorotrail_rpc_failovers_total` | counter | `reason` (switch \| reanchor) | Total number of RPC provider failover events, labelled by reason (switch \| reanchor). | Provider failovers in the multi-provider client: "switch" when traffic moved to a different provider, "reanchor" when a cursor request hit the failover-reanchor path and the caller had to discard its cursor (the expensive kind — reanchors mean lost progress, not just a new connection). |
+| `sorotrail_rpc_circuit_breaker_state` | gauge | `state` (closed \| open \| half-open) | Circuit breaker state as a 0/1 gauge per state (closed \| open \| half-open). | Exactly one state series is 1 at a time. Alert on {state="open"} == 1: the breaker is refusing calls outright, which is why ingestion has stopped rather than merely slowed. |
+| `sorotrail_rpc_provider_state` | gauge | `provider` (the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported); `state` (active \| degraded \| down) | Per-provider failover health state as a 0/1 gauge per state (active \| degraded \| down). | One 0/1 series per (provider, state). Only present in multi-provider mode (RPC_URLS). Shows which provider traffic is on and which have failed, without reading logs. |
+| `sorotrail_rpc_provider_demotions_total` | counter | `provider` (the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported); `reason` (consecutive_errors \| behind_cursor \| retention_gap \| network_mismatch \| divergence) | Total number of RPC provider demotions, labelled by provider and reason. | Every time a provider is demoted from active to degraded or down, labelled by the exact reason: consecutive network/5xx errors, lagging behind the ingestion cursor, retention window not covering the requested ledger range, network passphrase mismatch, or divergent event answers for an overlapping ledger. |
+| `sorotrail_rpc_provider_promotions_total` | counter | `provider` (the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported) | Total number of RPC provider promotions back to active, labelled by provider. | Every time a degraded or down provider completes probation and returns to active rotation. |
+
+## Storage metrics
+
+| Metric | Type | Labels | Help (as served) | Meaning |
+| --- | --- | --- | --- | --- |
+| `sorotrail_db_write_duration_seconds` | histogram | — | Database write latency in seconds (batch insert/upsert/repair). | Write path only: batch upserts, replace-in-range repairs. Compared against the ingester's write-latency budget it tells you whether backpressure is justified by the database or by our own accounting. |
+| `sorotrail_db_query_duration_seconds` | histogram | `operation` (store.<Store method> — a fixed table of method names (store.UpsertEvents, store.QueryEvents, …), one per guarded Store operation) | Store operation duration in seconds, labelled by operation. | Every guarded Store operation, reads and writes alike, so a slow database is attributable to a specific operation rather than showing up only as a slow API. |
+| `sorotrail_db_operations_total` | counter | `operation` (store.<Store method> — the same fixed table as sorotrail_db_query_duration_seconds); `outcome` (success \| error) | Total store operations, labelled by operation and outcome (success \| error). | Count of guarded Store calls. Errors are counted separately from successes so a failing backend is a direct query rather than something inferred by subtracting histograms. |
+| `sorotrail_db_attributed_cost_seconds_total` | counter | `originator` (matched HTTP route pattern (e.g. GET /events/{id}) or background worker id (ingester \| pruner \| auditor \| archiver \| reconciler \| webhook \| unknown)); `operation` (store.<Store method> — the same fixed table as sorotrail_db_query_duration_seconds); `tenant` (default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other) | Cumulative database query time in seconds attributed by originator, operation, and tenant. | Joins database execution time back to the HTTP endpoint or background worker and tenant that caused it, so capacity and quota decisions can be driven from observed database cost. |
+| `sorotrail_db_attributed_queries_total` | counter | `originator` (matched HTTP route pattern (e.g. GET /events/{id}) or background worker id (ingester \| pruner \| auditor \| archiver \| reconciler \| webhook \| unknown)); `operation` (store.<Store method> — the same fixed table as sorotrail_db_query_duration_seconds); `tenant` (default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other); `outcome` (success \| error) | Total database queries attributed by originator, operation, tenant, and outcome. | Counts database queries per originating route/background job and opaque tenant bucket, separating cheap high-frequency endpoints from rare expensive ones. |
+| `sorotrail_db_circuit_breaker_state` | gauge | `state` (closed \| open \| half-open) | Database circuit breaker state as a 0/1 gauge per state (closed \| open \| half-open). | Exposes whether the store circuit breaker is closed (normal), open (failing fast with 503 and Retry-After during a database outage), or half-open (probing recovery). |
+| `sorotrail_db_degraded_rejections_total` | counter | — | Total store calls rejected fast because the database circuit breaker is open. | Counts requests rejected immediately in degraded mode while the database circuit breaker is open, separating dependency-unavailable rejections from application errors. |
+
+## Batching metrics
+
+| Metric | Type | Labels | Help (as served) | Meaning |
+| --- | --- | --- | --- | --- |
+| `sorotrail_event_batch_writes_total` | counter | — | Total number of event store writes (UpsertEvents calls) issued by the ingester. | One per non-empty page with batching disabled; with batching enabled it is how many chunks the adaptive controller split pages into. Rising against a flat events-ingested counter means writes are being shaved smaller. |
+| `sorotrail_event_batch_size` | gauge | — | Current adaptive event batch size used for each store write. | The size the batch controller is currently feeding the store. It sits at the configured maximum while writes are inside the latency budget and steps down under pressure, so a falling gauge is the earliest signal that the store is starting to strain. |
+| `sorotrail_event_backpressure_total` | counter | — | Total number of throttle sleeps inserted between event batch writes. | How many times the ingester deliberately slept between writes because the store fell behind the latency budget. Non-zero proves backpressure is firing; paired with sorotrail_event_backpressure_seconds_total it separates brief hesitations from sustained throttling. |
+| `sorotrail_event_backpressure_seconds_total` | counter | — | Total seconds spent throttling event writes under backpressure. | Cumulative sleep time under backpressure — the surge priced in seconds. A long tail here means the database was slow for a sustained stretch, not just a burst. |
+
+## Other pipeline metrics
+
+| Metric | Type | Labels | Help (as served) | Meaning |
+| --- | --- | --- | --- | --- |
+| `sorotrail_dead_letters_total` | counter | `reason` (decode \| store) | Total number of poison events recorded in the dead-letter table, labelled by reason (decode \| store). | Poison events that could not be decoded or permanently failed per-event storage validation and were quarantined in dead_letters so ingestion could advance past them without stalling or silently dropping history. |
+| `sorotrail_spec_invalidations_received_total` | counter | — | Total number of spec cache invalidations received from other replicas. | Spec-cache invalidations this process applied because another replica said the contract's decoded shape changed. A non-zero value proves the cross-replica fan-out is working; a replica that never invalidates anything while its peers change specs is serving stale decodes. Stays at zero on a single-replica deployment, where there is nobody to hear from. |
+| `sorotrail_cost_budget_consumed_total` | counter | `tenant` (default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other) | Total query cost units charged against per-tenant cost budgets, by tenant. | Cost units each tenant has consumed from its COST_BUDGET_CAPACITY bucket. Only moves when the cost budget is enabled; compare its rate to COST_BUDGET_REFILL_PER_SEC to see which tenants run near their budget. |
+| `sorotrail_cost_estimated_total` | counter | — | Total query cost units estimated before execution for requests charged against a cost budget. | Pre-execution cost estimates. Divide the rate of sorotrail_cost_budget_consumed_total (actual units) by this to reconcile actual against estimate: near 1 means the estimator is sound, well below 1 means requests are over-charged up front and refunded. |
+| `sorotrail_http_deprecated_requests_total` | counter | `route` (the matched chi route pattern (e.g. /events/{id}), or "unmatched" for a path no route registered — never the raw path, so probes cannot grow cardinality); `method` (the HTTP method (GET \| POST \| PUT \| PATCH \| DELETE)) | Total HTTP requests to deprecated API endpoints, labelled by route and method. | Calls to HTTP endpoints marked deprecated: true in the OpenAPI specification. Operators watch this counter approach zero during a deprecation window before removing the endpoint after its Sunset date. |
+| `sorotrail_tls_certificate_expiry_days` | gauge | — | Minimum remaining validity in days across active mTLS certificates. | Remaining days until the earliest-expiring active mTLS certificate (HTTP listener, Postgres client, or Archive client) expires, updated whenever certificates are loaded or reloaded from disk. Alert when this drops below your rotation window (for example, < 7 days). |
+| `sorotrail_http_payload_size_rejections_total` | counter | `route` (the matched chi route pattern (e.g. /events/{id}), or "unmatched" for a path no route registered — never the raw path, so probes cannot grow cardinality); `reason` (request_body \| decompressed_body \| response_body) | Total HTTP requests or responses rejected for exceeding configured size limits, labelled by route and reason (request_body \| decompressed_body \| response_body). | Requests or responses rejected with HTTP 413 for exceeding HTTP_REQUEST_BODY_LIMIT (or an endpoint override), the decompressed Content-Encoding ceiling, or the response body size cap. Spikes indicate oversized client writes, compression-bomb attempts, or list queries that need smaller page limits. |
+
+## HTTP metrics (per-server registry)
+
+| Metric | Type | Labels | Help (as served) | Meaning |
+| --- | --- | --- | --- | --- |
+| `http_request_duration_seconds` | histogram | `route` (the matched chi route pattern (e.g. /events/{id}), or "unmatched" for a path no route registered — never the raw path, so probes cannot grow cardinality); `method` (the HTTP method (GET \| POST \| PUT \| PATCH \| DELETE)); `status` (the response status code as a decimal string (200 \| 404 \| 500 \| …)) | HTTP request duration in seconds, labeled by route, method, and status code. | Per-request latency for the whole API. One instance per metrics.HTTPMetrics (i.e. per server), merged with the global registry on scrape, so tests and parallel servers do not collide on the default registry. |
+
+## Label sets
+
+Every label value is drawn from a closed set, so series counts stay
+predictable and alert rules can name a value with confidence:
+
+| Label | Values | Used by |
+| --- | --- | --- |
+| `method` | getEvents \| getLatestLedger \| getHealth \| getLedgerEntries \| simulateTransaction | `sorotrail_rpc_call_duration_seconds`, `sorotrail_rpc_retries_total`, `sorotrail_rpc_backoff_seconds_total`, `sorotrail_http_deprecated_requests_total`, `http_request_duration_seconds` |
+| `operation` | store.<Store method> — a fixed table of method names (store.UpsertEvents, store.QueryEvents, …), one per guarded Store operation | `sorotrail_db_query_duration_seconds`, `sorotrail_db_operations_total`, `sorotrail_db_attributed_cost_seconds_total`, `sorotrail_db_attributed_queries_total` |
+| `originator` | matched HTTP route pattern (e.g. GET /events/{id}) or background worker id (ingester \| pruner \| auditor \| archiver \| reconciler \| webhook \| unknown) | `sorotrail_db_attributed_cost_seconds_total`, `sorotrail_db_attributed_queries_total` |
+| `outcome` | success \| error | `sorotrail_rpc_call_duration_seconds`, `sorotrail_db_operations_total`, `sorotrail_db_attributed_queries_total` |
+| `provider` | the hostname of one RPC_URLS entry — scheme, credentials, path and query are stripped, so nothing client-identifying is exported | `sorotrail_rpc_provider_state`, `sorotrail_rpc_provider_demotions_total`, `sorotrail_rpc_provider_promotions_total` |
+| `reason` | decode \| store | `sorotrail_dead_letters_total`, `sorotrail_rpc_retries_total`, `sorotrail_rpc_failovers_total`, `sorotrail_rpc_provider_demotions_total`, `sorotrail_http_payload_size_rejections_total` |
+| `route` | the matched chi route pattern (e.g. /events/{id}), or "unmatched" for a path no route registered — never the raw path, so probes cannot grow cardinality | `sorotrail_http_deprecated_requests_total`, `sorotrail_http_payload_size_rejections_total`, `http_request_duration_seconds` |
+| `state` | closed \| open \| half-open | `sorotrail_rpc_circuit_breaker_state`, `sorotrail_rpc_provider_state`, `sorotrail_db_circuit_breaker_state` |
+| `status` | the response status code as a decimal string (200 \| 404 \| 500 \| …) | `http_request_duration_seconds` |
+| `tenant` | default, or an opaque hashed tenant bucket (t_<8hex>) capped at 64 series with overflow folded into other | `sorotrail_db_attributed_cost_seconds_total`, `sorotrail_cost_budget_consumed_total`, `sorotrail_db_attributed_queries_total` |
+
+The `unmatched` route value and the hostname-only `provider` value
+are the two sets described in prose above; both are produced by the
+server, never by the client, which is what keeps their cardinality
+bounded.

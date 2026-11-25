@@ -279,11 +279,19 @@ enables alternative storage backends without changing any consumer.
 | `Stats` | Aggregate statistics for `/stats` |
 | `Ping` | Dependency health check |
 
-#### Postgres backend (`store.Postgres`)
+#### Backend implementations
 
-The only backend implemented today. Uses `pgx` (plain SQL, no ORM) with a
-connection pool. Schema changes are managed via numbered migration pairs in
-`internal/store/migrations/`.
+- **Postgres** (`store.Postgres`) is the reference backend. It uses `pgx`
+  (plain SQL, no ORM) with a connection pool, and schema changes are managed
+  via numbered migration pairs in `internal/store/migrations/`.
+- **SQLite** (`store.SQLite`) is the single-node backend selected with a
+  `sqlite:` URL. It implements the event path and contract inventory; token
+  metadata enrichment remains Postgres-only and refuses explicitly.
+- **ClickHouse** (`store.ClickHouse`) is an optional analytical backend
+  selected with a `clickhouse:` URL. It is not a drop-in replacement for
+  Postgres: some methods refuse and others silently return zero values. Its
+  capability matrix is documented in
+  [ClickHouse backend support](clickhouse.md).
 
 **Schema highlights:**
 
@@ -451,14 +459,20 @@ ingest rather than silently producing incorrect results:
 The `store.Store` interface is the persistence boundary. It is designed so
 that each method is independently testable and replaceable:
 
-- **Postgres** (`store.Postgres`): the only backend implemented today.
-  Uses `pgx` with plain SQL. Migrations are numbered pairs in
+- **Postgres** (`store.Postgres`) is the reference backend. It uses `pgx`
+  with plain SQL. Migrations are numbered pairs in
   `internal/store/migrations/`.
 
-- **Alternative backends**: the interface is intentionally minimal. A
-  contributor can implement `Store` for SQLite, DynamoDB, or any other
-  persistence layer. The contract requires `QueryEvents` to return events
-  in ascending ID order for cursor pagination to work.
+- **SQLite and ClickHouse** are the alternative backends selected by
+  `DATABASE_URL`. SQLite implements the event path and contract inventory for
+  single-node deployments; ClickHouse is an optional analytical backend whose
+  support matrix — including the methods that silently do nothing — is in
+  [ClickHouse backend support](clickhouse.md).
+
+- **Further backends**: the interface is intentionally minimal. A contributor
+  can implement `Store` for DynamoDB or another persistence layer. The
+  contract requires `QueryEvents` to return events in ascending ID order for
+  cursor pagination to work.
 
 Replay-specific persistence (`store.ReplayLock`, `GetReplayState`, etc.) is
 deliberately **not** part of the `Store` interface. It lives on
@@ -473,6 +487,8 @@ forced to implement one.
 | Stellar RPC client | ✅ Complete — `getEvents`, `getLatestLedger`, `getHealth` |
 | XDR decoder | ✅ Complete — all ScVal types handled, lossless fallback |
 | Postgres store | ✅ Complete — full `Store` interface implemented |
+| SQLite store | ✅ Event path + contract inventory; token metadata enrichment refuses explicitly |
+| ClickHouse store | ⚠️ Optional analytical backend with documented gaps — see [ClickHouse backend support](clickhouse.md) |
 | Ingester | ✅ Complete — cold/warm start, filter batching, backoff |
 | HTTP API | ✅ Complete — events, health, stats, contract queries |
 | Auditor | ✅ Complete — verification, auto-repair, finding lifecycle |
@@ -709,6 +725,25 @@ ingester logs a warning and skips ahead to the oldest retained ledger.
 **Extension interface:** `ingester.EventNotifier` — attach post-ingest
 hooks (webhook delivery, SSE, etc.) without modifying the loop.
 
+#### The watch list and its network dimension
+
+Every watch-list row is keyed by `(network, contract_id)` (migration `0027`), where an empty network is normalized to `'default'`. The store surfaces the union of the operator table (`watched_contracts`) and the multi-tenant table (`tenant_watched_contracts`):
+
+```sql
+SELECT network, contract_id FROM watched_contracts
+UNION
+SELECT network, contract_id FROM tenant_watched_contracts
+```
+
+How `NETWORK` flows through startup, the API, and ingestion:
+
+- **Startup seeding (`cmd/sorotrail/main.go`)**: each contract in `WATCHED_CONTRACTS` is seeded via `AddWatchedContract` with `Network: cfg.Network` (`default` when `NETWORK` is unset).
+- **Operator runtime API (`POST /watched-contracts`, `DELETE /watched-contracts/{id}`)**: `POST /watched-contracts` accepts an optional `"network"` field in the request body; when omitted or empty, the API server falls back to its configured `NETWORK` (`default` if unset). `DELETE /watched-contracts/{id}` accepts `?network=<name>` with the same fallback. `GET /watched-contracts` returns every `(network, contract_id)` pair across all networks, plus the `from_config` overlay for the API process's own network.
+- **Filter batch selection (`buildFilterBatches` in `internal/ingester/ingester.go`)**: on every cycle, the ingester calls `ListWatchedContracts(ctx)` and keeps only entries whose `network` matches the ingester's configured `NETWORK` (treating `""` as `"default"`).
+  - If the filtered list for **that network** is empty, `buildFilterBatches` returns a single type-only filter (`[{Type: "contract"}]`) and the ingester indexes **all** contract events on its network — even if other networks have explicit watch-list rows in the same database.
+  - If one or more contracts are watched on that network, `buildFilterBatches` packs those contract IDs into batches of up to 5 filters × 5 contract IDs (25 contracts per RPC request chain).
+- **Multi-network shared-database topology**: because `events`, `ingestion_state`, `audit_state`, `audit_findings`, and `watched_contracts` are all partitioned or keyed by `network`, a single Postgres database can back multiple SoroTrail processes — one ingester per network (for example, one process with `NETWORK=testnet` and another with `NETWORK=mainnet`). Each ingester advances its own `ingestion_state` row and polls only the contracts registered for its `NETWORK`, while read servers query across or within networks without interference.
+
 ### [`internal/broadcast`](../internal/broadcast/) — Pub-sub stream
 
 The `Broadcaster` distributes ingested events to live subscribers (WebSocket
@@ -723,7 +758,8 @@ silently evicted to prevent back-pressure on the ingester.
 - `SubscriberCount()` — observable metric for operators.
 
 The broadcaster is wired in `main.go` and consumed by the WebSocket
-handler (`GET /events/ws`).
+handler (`GET /events/ws`). See [Live Subscriptions](subscriptions.md) for
+the delivery guarantees, reconnection guidance, and the catch-up pattern.
 
 ### [`internal/webhook`](../internal/webhook/) — Async delivery
 
@@ -878,6 +914,60 @@ surface at a glance.
 See the [README caching section](../README.md#caching) for the full
 rationale, including the `CACHE_PRIVATE` flag for auth'd deployments.
 
+### Authoritative in-process cache inventory & cross-replica invalidation
+
+Every in-process cache across the repository is catalogued in
+`store.AuthoritativeCacheInventory` (`internal/store/cache_inventory.go`) and
+guarded by `TestCacheInventoryCoversAllRepoCaches`
+(`internal/store/cache_inventory_test.go`), which walks the Go AST and fails CI
+whenever a new cache struct, cache-bearing field, or `sync.Map` is introduced
+without an inventory entry.
+
+All security- and correctness-relevant caches share a single PostgreSQL
+`LISTEN`/`NOTIFY` invalidation channel (`sorotrail_spec_invalidation`, defined
+in `internal/store/invalidation.go`) rather than opening separate listener
+connections per cache:
+
+- `spec:<contract_id>` (or bare `<contract_id>` for wire backward compatibility)
+  evicts the contract's cached spec and spec-hash mapping (`spec.Cache`).
+- `tenant:<tenant_id>` evicts only that tenant's cached API credentials,
+  `Tenant` status/quotas, and contract `Scope` (`api.AuthCache`), evicts that
+  tenant's cached `/stats` entries (`api.StatsCache`), evicts that tenant's
+  rate-limiter token bucket (`api.RateLimiter`), and immediately wakes open SSE
+  and WebSocket stream scope watchers (`api.Server.syncStreamScope`).
+- `apikey:<key_id>` evicts that single API key (`api.AuthCache`) and
+  immediately wakes any open SSE/WebSocket streams authenticated with that key
+  so revoked keys stop receiving events immediately.
+- `persisted:<id|*>` triggers a manifest reload on `graphql.PersistedRegistry`
+  when persisted GraphQL operations are backed by a shared manifest.
+
+| Cache ID | Package & Symbol | What It Holds | Lifetime / TTL | Invalidation Trigger | Cross-Replica Channel | Max Revocation / Staleness Latency |
+|---|---|---|---|---|---|---|
+| `spec.Cache` | `internal/spec` (`Cache`) | Parsed contract specs (by spec hash) and `contractID -> specHash` mappings | Spec TTL (`1h` default) and mapping TTL (`5m` default) | Spec override upsert/delete, WASM upgrade detection, or `Invalidate(contractID)` | Yes (`spec:<contract_id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY`); `5m` fallback if disconnected |
+| `api.AuthCache` | `internal/api` (`AuthCache`) | Tenant API key digests, `Tenant` records (`Enabled`, `Admin`, `Wildcard`, quotas), and resolved `Scope` | Bounded short TTL (`DefaultAuthCacheTTL = 5s`) | Tenant update/suspension/deletion, contract grant/revocation, or API key revocation | Yes (`tenant:<id>`, `apikey:<id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY`); hard upper bound `5s` TTL |
+| `api.StatsCache` | `internal/api` (`StatsCache`) | Assembled `/stats` responses keyed by `Scope.Fingerprint()` and indexed by tenant ID | `STATS_CACHE_TTL` (`5s` default) | TTL expiry or tenant update/delete/contract grant/revocation | Yes (`tenant:<id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY`); hard upper bound `5s` TTL |
+| `api.RateLimiter` | `internal/api` (`RateLimiter`) | Per-client IP and per-tenant (`tenant:<id>`) token-bucket rate limiters | `5m` idle TTL (swept every `1m`) | Idle eviction or tenant quota update/deletion | Yes (`tenant:<id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY`); re-seeded from updated `Tenant` quota on next request |
+| `api.syncStreamScope` | `internal/api` (`syncStreamScope`) | Open SSE/WebSocket `broadcast.Subscription` tenant `Scope` snapshot and active API key liveness | Periodic refresh (`StreamScopeSync = 30s` default) + immediate wake channel | Cross-replica `tenant:<id>` or `apikey:<id>` signal, or `30s` refresh ticker | Yes (`tenant:<id>`, `apikey:<id>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY` wake channel); fallback `30s` `StreamScopeSync` |
+| `graphql.PersistedRegistry` | `internal/api/graphql` (`PersistedRegistry`) | Registered persisted GraphQL operations (`SHA-256 -> validated query`) | Process lifetime or manifest reload | Admin `PUT`/`POST`/`DELETE` on `/graphql/persisted` or cross-replica invalidation | Yes (`persisted:<id\|*>`) | Immediate (`<100ms` via `LISTEN`/`NOTIFY` when backed by shared manifest) |
+| `api.LagTracker` | `internal/api` (`LagTracker`) | Latest Stellar RPC chain head ledger number (`cachedLedger`) for `/stats` and `/metrics` | Bounded short TTL (`5s` default) | `5s` TTL expiry on next `LatestLedger(ctx)` call | No (telemetry-only) | `5s` TTL (read-only external RPC chain head telemetry) |
+| `decode.CachingDecoder` | `internal/decode` (`CachingDecoder`) | Bounded LRU (`4096` entries) memoizing pure base64 `ScVal` XDR -> decoded JSON | Process lifetime with `4096`-entry LRU eviction | LRU capacity eviction (pure deterministic XDR decoding) | No (pure memoization) | `0ms` (pure deterministic function of immutable XDR input) |
+| `meta.workerSingleFlightMap` | `internal/meta` (`workerSingleFlightMap`) | Process-local singleflight deduplication map for concurrent metadata fetches | Process lifetime | None (coordinates concurrent RPC metadata lookups) | No (non-security metadata) | N/A (singleflight helper) |
+
+#### Missed-invalidation observability and reconnect recovery
+
+If a replica's dedicated `LISTEN` connection drops (`SpecInvalidationListener`),
+the disconnection is never silent:
+- `SpecInvalidationListener.RecordDisconnect` logs a structured `WARN` line with
+  `channel`, `error`, `backoff`, and cumulative `disconnect_errors`, and
+  increments `InvalidationListenerStats.DisconnectErrors`.
+- Failed `NOTIFY` publishes on any replica log a structured `WARN` line and
+  increment `Server.InvalidationPublishFailures()`.
+- Upon re-subscribing, `SpecInvalidationListener.RecordReconnect` invokes
+  `OnReconnect` (`Server.OnInvalidationReconnect` and `spec.Cache.Clear`),
+  flushing `AuthCache`, `StatsCache`, `RateLimiter` buckets, `spec.Cache`, and
+  waking all open stream watchers so any invalidation missed during the
+  disconnect window is reconciled immediately.
+
 ## Data integrity
 
 The background auditor provides the strongest trust signal SoroTrail can
@@ -885,3 +975,92 @@ offer: `verified_through_ledger` in `/stats` names the highest ledger
 whose stored events have been verified against the RPC, not merely
 ingested. See the [Data integrity section](../README.md#data-integrity)
 for the auditor's contract and edge-case handling.
+
+### Chain reorganisation model, confirmation window, and derived-state reconciliation
+
+While finalized Stellar ledgers do not reorganise under normal consensus, an
+upstream Soroban RPC pool (load-balanced nodes, failover replicas, or local
+sandbox restarts) can roll back its tip or rewrite events within a recent
+unconfirmed window. SoroTrail treats recent ledgers within a bounded
+**confirmation window** (`Options.ReorgConfirmationWindow`, default `64`
+ledgers via `ingester.DefaultReorgConfirmationWindow`) as subject to
+reorganisation and guarantees deterministic reconciliation across the primary
+event table and all derived state.
+
+#### 1. Detection (`ingester.ReorgTracker`)
+
+`ingester.ReorgTracker` maintains a bounded sliding window of deterministic per-ledger
+event fingerprints (`ingester.ComputeLedgerFingerprint`, SHA-256 over sorted
+canonical `(id, contract_id, tx_hash, tx_index, op_index, type, in_successful_call, topics, value)` tuples)
+for the most recent `ReorgConfirmationWindow` ledgers and detects two classes of
+upstream reorganisation during live polling:
+
+- **Tip regression** (`ReorgTracker.CheckTipRegression` / `Ingester.maybeHandleTipRegression`):
+  the RPC's reported `latestLedger` drops below the highest previously observed
+  or persisted ledger (`from = latestLedger + 1`, `to = highestObserved`).
+- **Content divergence** (`ReorgTracker.RecordLedgerHash` / `Ingester.recordIngestedLedgerFingerprints`):
+  a re-observed ledger within the confirmation window produces a fingerprint
+  different from the previously recorded fingerprint for that ledger sequence.
+
+Concurrent or overlapping reorg signals for the same `Ingester` are coalesced
+by an internal coordinator (`reorgCoordinator`) so overlapping ledger ranges
+are merged into `[min(from), max(to)]` and reconciled sequentially without
+deadlocking or racing.
+
+#### 2. Derived-state retraction and re-ingestion (`store.ReconcileReorgRange`)
+
+When `Ingester.HandleReorgRange(ctx, client, fromLedger, toLedger, newHeadLedger)`
+runs on a valid reorg range `[from, to]`, it re-fetches all filter batches across
+`[from, to]` before mutating the store, then invokes `store.ReconcileReorgRange`
+(backed on `*Postgres` and `*SQLite` by `TransactionalReorgMaintainer.ReconcileReorgTx`
+inside a single database transaction) to reconcile both primary rows and every
+derived state table atomically:
+
+| State / Surface | Action on Reorg over `[from, to]` |
+|---|---|
+| `events` | Orphaned events in `[from, to]` missing from the replacement set or carrying modified payloads are recorded in `RetractedEventIDs`; previous rows in `[from, to]` are deleted (`ReorgMaintainer.DeleteEventsInRange`) and canonical replacement events are upserted (`InsertedEventIDs`), even when the replacement set is empty. |
+| `event_addresses` | Derived address references for all previous event IDs in `[from, to]` are explicitly deleted via `ReorgMaintainer.DeleteAddressRefsByEventIDs` (`RetractedAddressRefs`) and re-indexed for canonical replacement events (`InsertedAddressRefs`). |
+| `dead_letters` | Unresolved dead-letter entries in `[from, to]` are purged via `ReorgMaintainer.DeleteDeadLettersInRange` (`RetractedDeadLetters`) so stale poison pills from retracted ledgers never linger. |
+| `contract_cursors` | Per-contract cursors at or above `from` are clamped to `newHeadLedger` (or `from - 1` when `RewindCursorsToFromLedger` is set) with an empty pagination cursor (`RewoundContractCursors`). |
+| `ingestion_state` | When `last_ingested_ledger >= from`, stale pagination cursors are cleared and `last_ingested_ledger` is clamped to `newHeadLedger` (or `from - 1` when `RewindCursorsToFromLedger` is set) (`RewoundIngestionLedger`). |
+| `audit_state` | If `verified_through_ledger >= from`, the auditor high-water mark is clamped back to `from - 1` (`RewoundAuditLedger`) so the auditor re-verifies the reorganised range. |
+
+#### 3. Subscription & webhook retraction notices (`ingester.ReorgNotifier`)
+
+Downstream consumers that may have already received events from `[from, to]`
+over live streams or webhooks can implement `ingester.ReorgNotifier`
+(`NotifyReorgRetraction(ctx, ReorgRetractionNotice)`). After `store.ReconcileReorgRange`
+commits, `HandleReorgRange` emits a `ReorgRetractionNotice` containing:
+
+- `Network`, `FromLedger`, `ToLedger`, `NewHeadLedger`, `DetectedAt`
+- `RetractedEventIDs` (sorted TOIDs removed or rewritten in `[from, to]`)
+- `ReplacementEventIDs` and `ReplacementEvents` (canonical replacement events in `[from, to]`)
+
+#### 4. Confirmation window limit & cold-archive immutability boundary
+
+Two hard boundaries fail closed with structured alerts and Prometheus counters:
+
+1. **Confirmation window depth limit (`ingester.ErrReorgDepthExceeded`)**:
+   If a reorg's depth (`to - from + 1` or distance from the ingested tip)
+   exceeds `ReorgConfirmationWindow`, `HandleReorgRange` refuses automatic
+   retraction, increments `sorotrail_reorg_window_exceeded_total`, and logs a
+   structured `ERROR` alert so an operator can inspect the upstream RPC before
+   mutating deep history.
+2. **Cold-archive immutability boundary (`ingester.ErrReorgTouchesArchivedRange`)**:
+   Cold-archived ledger ranges (configured via `Ingester.SetArchivedThroughLedger`
+   or `Ingester.SetArchiveBoundary`) are immutable. If `fromLedger <= archivedThroughLedger`,
+   `HandleReorgRange` refuses to mutate stored or archived state, increments
+   `sorotrail_reorg_archived_boundary_violations_total`, and returns
+   `ErrReorgTouchesArchivedRange`.
+
+#### 5. Reorg observability metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `sorotrail_reorgs_detected_total` | Counter | Total chain reorganisations detected by the ingester |
+| `sorotrail_reorg_depth_ledgers` | Histogram | Depth (in ledgers) of detected chain reorganisations |
+| `sorotrail_reorg_window_limit_ledgers` | Gauge | Configured maximum reorg confirmation window depth in ledgers |
+| `sorotrail_reorg_window_utilization_ratio` | Gauge | Ratio of the most recent reorg depth to the configured confirmation window limit |
+| `sorotrail_reorg_window_exceeded_total` | Counter | Total reorgs rejected because their depth exceeded the confirmation window |
+| `sorotrail_reorg_archived_boundary_violations_total` | Counter | Total reorgs rejected because they touched a cold-archived ledger range |
+| `sorotrail_reorg_retracted_rows_total` | CounterVec (`table`) | Total rows retracted or rewound during reorg reconciliation (`events`, `event_addresses`, `dead_letters`, `contract_cursors`) |

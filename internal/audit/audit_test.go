@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -502,4 +503,325 @@ func TestPassOnce_SpanHierarchy(t *testing.T) {
 	require.NotNil(t, reconcileSpan, "audit.reconcile_range span must be present")
 	assert.Equal(t, passSpan.SpanContext.SpanID(), reconcileSpan.Parent.SpanID(),
 		"reconcile_range must be a child of audit.pass")
+}
+
+// TestLedgerMatches pins the ledger comparison the auditor certifies
+// ranges with: a false match here would certify a real gap as clean, so
+// both directions (match and mismatch) and the zero-vs-zero empty case
+// are worth pinning. The comparison is count-based — the RPC gives event
+// IDs but the census gives counts — so it must never be swayed by the
+// order the IDs happen to arrive in, and only the entry for the ledger
+// under test may influence the result.
+func TestLedgerMatches(t *testing.T) {
+	const l = uint32(42)
+
+	tests := []struct {
+		name   string
+		rpc    map[uint32][]string
+		stored map[uint32]int
+		want   bool
+	}{
+		{
+			name:   "identical counts match",
+			rpc:    map[uint32][]string{l: {"ev1", "ev2", "ev3"}},
+			stored: map[uint32]int{l: 3},
+			want:   true,
+		},
+		{
+			name:   "store holds more events than the RPC reports",
+			rpc:    map[uint32][]string{l: {"ev1"}},
+			stored: map[uint32]int{l: 2},
+			want:   false,
+		},
+		{
+			name:   "store holds fewer events than the RPC reports",
+			rpc:    map[uint32][]string{l: {"ev1", "ev2"}},
+			stored: map[uint32]int{l: 1},
+			want:   false,
+		},
+		{
+			name:   "empty on both sides matches",
+			rpc:    map[uint32][]string{},
+			stored: map[uint32]int{},
+			want:   true,
+		},
+		{
+			name:   "ledger absent from both maps matches",
+			rpc:    map[uint32][]string{99: {"ev1"}},
+			stored: map[uint32]int{99: 1},
+			want:   true,
+		},
+		{
+			name:   "RPC reports events the store has not counted yet",
+			rpc:    map[uint32][]string{l: {"ev1", "ev2"}},
+			stored: map[uint32]int{},
+			want:   false,
+		},
+		{
+			name:   "store counts events the RPC no longer reports",
+			rpc:    map[uint32][]string{},
+			stored: map[uint32]int{l: 1},
+			want:   false,
+		},
+		{
+			name:   "arrival order of the RPC IDs cannot fool the comparison",
+			rpc:    map[uint32][]string{l: {"ev3", "ev1", "ev2"}},
+			stored: map[uint32]int{l: 3},
+			want:   true,
+		},
+		{
+			name:   "only the ledger under test is consulted",
+			rpc:    map[uint32][]string{l: {"ev1"}, 43: {"ev2", "ev3"}},
+			stored: map[uint32]int{l: 1, 43: 99},
+			want:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// ledgerMatches reads only its arguments, so a zero Auditor
+			// is a complete receiver for this test.
+			got, err := (&Auditor{}).ledgerMatches(l, tt.rpc, tt.stored)
+			require.NoError(t, err, "the comparison is arithmetic and cannot fail")
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestClusterIsClean pins the window-level verdict that decides whether a
+// finding is closed as repaired or retried: a false clean would retire a
+// real gap and advance the high-water mark over it, a false unclean would
+// re-repair a healthy window until it is declared unrecoverable. The
+// window's edges are part of it — a mismatch on either boundary ledger
+// must count, while events just outside the window must not — and a
+// window with nothing to compare is clean rather than an error, so an
+// empty range cannot wedge the repair loop.
+func TestClusterIsClean(t *testing.T) {
+	tests := []struct {
+		name      string
+		from, to  uint32
+		rpc       map[uint32]int // events the RPC reports for each ledger
+		rpcErr    error          // when set, the RPC fails instead of answering
+		stored    map[uint32]int // events the store holds for each ledger
+		wantClean bool
+	}{
+		{
+			name:      "a window with no mismatches is clean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{100: 1, 101: 2, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 2, 102: 1, 103: 1},
+			wantClean: true,
+		},
+		{
+			name:      "a ledger the store is missing makes the window unclean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{100: 1, 101: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 102: 1, 103: 1},
+			wantClean: false,
+		},
+		{
+			name:      "a ledger the store kept but the RPC forgot makes the window unclean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{100: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 1, 102: 1, 103: 1},
+			wantClean: false,
+		},
+		{
+			name:      "a count that disagrees on one ledger makes the window unclean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{101: 2},
+			stored:    map[uint32]int{101: 1},
+			wantClean: false,
+		},
+		{
+			name:      "a window with no events on either side is clean",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{},
+			stored:    map[uint32]int{},
+			wantClean: true,
+		},
+		{
+			name:      "an inverted range has nothing to compare and reads clean",
+			from:      200,
+			to:        100,
+			rpc:       map[uint32]int{},
+			stored:    map[uint32]int{},
+			wantClean: true,
+		},
+		{
+			name:      "a mismatch on the first ledger of the window counts",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{101: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 1, 102: 1, 103: 1},
+			wantClean: false,
+		},
+		{
+			name:      "a mismatch on the last ledger of the window counts",
+			from:      100,
+			to:        103,
+			rpc:       map[uint32]int{100: 1, 101: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 1, 102: 1},
+			wantClean: false,
+		},
+		{
+			name:      "events just outside the window are ignored",
+			from:      100,
+			to:        102,
+			rpc:       map[uint32]int{99: 1, 100: 1, 101: 1, 102: 1, 103: 1},
+			stored:    map[uint32]int{100: 1, 101: 1, 102: 1},
+			wantClean: true,
+		},
+		{
+			name:      "an RPC failure surfaces as an error, not a clean verdict",
+			from:      100,
+			to:        103,
+			rpcErr:    errors.New("connection refused"),
+			wantClean: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, cli, st, _ := reconcileSetup(t, auditOptions())
+
+			// Both sides are seeded with the row-id format the RPC mock
+			// generates, so equal counts describe the same events.
+			var seeded []store.Event
+			for l, n := range tt.stored {
+				for _, e := range mkEvents(l, n, testContract) {
+					seeded = append(seeded, store.Event{
+						ID:         e.ID,
+						ContractID: e.ContractID,
+						Ledger:     int64(e.Ledger),
+						Type:       e.Type,
+					})
+				}
+			}
+			_, err := st.UpsertEvents(context.Background(), seeded)
+			require.NoError(t, err)
+
+			cli.extraResponses = func(int) (rpc.GetEventsResponse, error) {
+				if tt.rpcErr != nil {
+					return rpc.GetEventsResponse{}, tt.rpcErr
+				}
+				var evs []rpc.Event
+				for l, n := range tt.rpc {
+					evs = append(evs, mkEvents(l, n, testContract)...)
+				}
+				return rpc.GetEventsResponse{Events: evs, LatestLedger: 1_000}, nil
+			}
+
+			clean, err := a.clusterIsClean(context.Background(), tt.from, tt.to)
+			if tt.rpcErr != nil {
+				require.Error(t, err, "an unreachable RPC must surface, never read as clean")
+				assert.False(t, clean, "a failed check is not a clean verdict")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantClean, clean)
+		})
+	}
+}
+
+type stubAuditLagController struct {
+	yield  bool
+	reason string
+}
+
+func (s *stubAuditLagController) ShouldYield(string) (bool, string) {
+	return s.yield, s.reason
+}
+
+func TestAuditorPassOnceLagBackpressureAndMaxDeferral(t *testing.T) {
+	a, cli, st, _ := setup(t, Options{})
+	primeIngest(st, 500)
+	cli.health = rpc.Health{Status: "healthy", OldestLedger: 1, LatestLedger: 600}
+
+	lagCtrl := &stubAuditLagController{yield: true, reason: "ingest_lagging"}
+	a.WithLagController(lagCtrl)
+
+	// While lagging, PassOnce defers before issuing any RPC requests.
+	worked, err := a.PassOnce(context.Background())
+	require.NoError(t, err)
+	assert.False(t, worked)
+	assert.Equal(t, uint64(1), a.Metrics().LagYields)
+	assert.Equal(t, uint64(0), a.Metrics().RPCRequests)
+
+	// Once max deferral is reached, PassOnce runs and records the override.
+	lagCtrl.yield = false
+	lagCtrl.reason = "max_deferral_reached"
+	_, err = a.PassOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), a.Metrics().MaxDeferralOverrides)
+	assert.GreaterOrEqual(t, a.Metrics().RPCRequests, uint64(1))
+}
+
+func TestNewEdgeCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		client     rpc.Client
+		st         store.Store
+		reingest   Reingester
+		opts       Options
+		wantBatch  uint32
+		wantPoll   time.Duration
+		wantRepair int
+	}{
+		{
+			name:       "empty options receives defaults",
+			client:     &mockRPC{},
+			st:         newMockStore(),
+			reingest:   &stubReingest{},
+			opts:       Options{},
+			wantBatch:  DefaultBatchLedgers,
+			wantPoll:   DefaultPollInterval,
+			wantRepair: DefaultMaxRepairAttempts,
+		},
+		{
+			name:     "custom positive values preserved",
+			client:   &mockRPC{},
+			st:       newMockStore(),
+			reingest: &stubReingest{},
+			opts: Options{
+				BatchLedgers:      500,
+				PollInterval:      10 * time.Second,
+				MaxRepairAttempts: 5,
+				FindingMaxLedgers: 50,
+				LagThreshold:      150,
+				Network:           "custom-net",
+			},
+			wantBatch:  500,
+			wantPoll:   10 * time.Second,
+			wantRepair: 5,
+		},
+		{
+			name:     "negative values replaced by defaults",
+			client:   nil,
+			st:       nil,
+			reingest: nil,
+			opts: Options{
+				PollInterval:      -5 * time.Second,
+				MaxRepairAttempts: -2,
+			},
+			wantBatch:  DefaultBatchLedgers,
+			wantPoll:   DefaultPollInterval,
+			wantRepair: DefaultMaxRepairAttempts,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := New(tt.client, tt.st, tt.reingest, testLogger(), tt.opts)
+			assert.NotNil(t, a)
+			assert.Equal(t, tt.wantBatch, a.opts.BatchLedgers)
+			assert.Equal(t, tt.wantPoll, a.opts.PollInterval)
+			assert.Equal(t, tt.wantRepair, a.opts.MaxRepairAttempts)
+		})
+	}
 }

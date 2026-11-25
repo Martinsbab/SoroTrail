@@ -10,7 +10,15 @@ info:
     JSON-producing operations accept the shared `pretty=true` query
     parameter to indent responses for human inspection; it does not change
     the response data.
-  version: "0.1.0"
+
+    The event, contract and address read operations answer conditional
+    requests. A 200 response carries a strong `ETag`, a hash of the exact
+    response body, and a request that repeats it in `If-None-Match` gets
+    `304 Not Modified` with no body when nothing has changed. The listing
+    operations stay `Cache-Control: no-cache`, so a client revalidates on
+    every poll and the validator makes that revalidation cheap. `/health`
+    and `/stats` change constantly and are never tagged.
+  version: "0.2.0"
   license:
     name: Apache-2.0
     url: https://www.apache.org/licenses/LICENSE-2.0
@@ -33,7 +41,16 @@ paths:
       summary: Dependency health check
       description: >-
         Report whether the API process can reach its database and RPC
-        dependencies. This probe is public and does not expose tenant data.
+        dependencies, with each dependency's state reported individually.
+        This probe is public and does not expose tenant data.
+
+        Every check runs concurrently under its own 5-second timeout, so
+        one hung dependency cannot starve another's budget. Each check
+        reports `status` (`ok`, `degraded` or `unready`), a `detail`
+        explaining any non-ok status, and how long that check alone took.
+        200 only when every check is `ok`; a `degraded` or `unready` check
+        answers 503. Ingestion freshness is deliberately not part of this
+        probe — see `/readyz`.
       tags: [System]
       security: []
       responses:
@@ -46,19 +63,22 @@ paths:
               example:
                 status: ok
                 checks:
-                  database: ok
-                  rpc: ok
+                  database: {status: ok, latency_ms: 1}
+                  rpc: {status: ok, latency_ms: 84}
         "503":
-          description: One or more dependencies degraded
+          description: At least one dependency is degraded or unready
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
               example:
-                status: degraded
+                status: unready
                 checks:
-                  database: ok
-                  rpc: unavailable
+                  database: {status: ok, latency_ms: 1}
+                  rpc:
+                    status: unready
+                    detail: "Get \"https://rpc.example/\": connection refused"
+                    latency_ms: 12
   /events:
     get:
       operationId: listEvents
@@ -173,6 +193,7 @@ paths:
             format: int64
             minimum: 1
           example: 256000
+        - $ref: "#/components/parameters/IdempotencyKey"
       security:
         - ManagementKey: []
       responses:
@@ -192,6 +213,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -530,6 +553,8 @@ paths:
         and gated behind the admin credential. A name is required; quota
         overrides are optional and inherit the instance defaults when omitted.
       tags: [Admin]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -557,6 +582,8 @@ paths:
                 created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -621,7 +648,10 @@ paths:
       description: >-
         Administrative endpoint, available only when MULTI_TENANT is enabled
         and gated behind the admin credential. PATCH semantics apply: fields
-        omitted from the JSON object retain their stored values.
+        omitted from the JSON object retain their stored values. An update
+        that shortens the tenant's effective retention horizon is refused
+        with 409 unless confirm_retention_shortening is true, and is recorded
+        in the administrative audit log with the old and new horizon.
       tags: [Admin]
       parameters:
         - name: id
@@ -635,6 +665,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -661,6 +692,8 @@ paths:
                 created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -692,6 +725,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: Deleted
@@ -755,6 +789,9 @@ paths:
                     requests: 12345
                     events_served: 67890
                     stream_seconds: 3600
+                watched_contracts:
+                  held: 7
+                  limit: 10
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -836,6 +873,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -859,12 +897,16 @@ paths:
                   - "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -897,6 +939,7 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: >-
@@ -917,6 +960,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -996,6 +1041,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -1020,12 +1066,16 @@ paths:
                 created_at: "2026-07-21T00:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -1051,6 +1101,7 @@ paths:
             format: int64
             minimum: 1
           example: 7
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: Deleted
@@ -1062,6 +1113,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -1102,6 +1155,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
     post:
       operationId: createAPIKey
       summary: Create an API key
@@ -1115,6 +1170,8 @@ paths:
       tags: [Auth]
       security:
         - InstanceAPIKey: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: false
         content:
@@ -1149,12 +1206,18 @@ paths:
                 key: "sorotrail_a1b2c3d4e5f60718_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /apikeys/{id}:
     delete:
       operationId: revokeAPIKey
@@ -1179,6 +1242,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: Revoked
@@ -1188,10 +1252,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /contracts:
     get:
       operationId: listContracts
@@ -1260,14 +1328,20 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /livez:
     get:
       operationId: livez
       summary: Liveness probe
       description: >-
-        Reports only that the process is up. Never touches the database or RPC.
-        It therefore has no failure response: a process that cannot answer 200
-        here cannot answer at all.
+        Reports only that the process is up. Never touches the database or
+        RPC — the `checks` object carries the single `process` check and
+        nothing else, and that independence is the contract: a dependency
+        outage must not fail a liveness probe, or the orchestrator would
+        restart the one component that could have reported the outage. A
+        process that cannot answer 200 here cannot answer at all, so there
+        is no failure response.
       tags: [Operations]
       security: []
       responses:
@@ -1279,19 +1353,39 @@ paths:
                 $ref: "#/components/schemas/HealthResponse"
               example:
                 status: ok
-                checks: {}
+                checks:
+                  process: {status: ok, latency_ms: 0}
   /readyz:
     get:
       operationId: readyz
       summary: Readiness probe
       description: >-
-        Reports whether the database, RPC and schema are usable, and whether
-        ingestion has fallen more than 100 ledgers behind the chain head.
+        Reports whether the database, RPC and ingestion freshness are usable,
+        with each dependency's state reported individually so a failing probe
+        names the dependency that failed without anyone reading logs.
+
+        Every check runs concurrently under its own 5-second timeout. The
+        thresholds that separate the states:
+
+        - `unready` — a dependency gave no answer (it errored, or blew its
+          5-second per-check budget): the database is unreachable, the RPC
+          is unreachable, the ingestion state row cannot be read, or the
+          chain head is needed but unavailable.
+        - `degraded` — everything answered, but a dependency reports a
+          suboptimal state: the RPC answers `getHealth` with something
+          other than "healthy", or ingestion is more than 100 ledgers
+          behind the chain head (`readinessLagThreshold`, evaluated only
+          once at least one ledger has been ingested).
+        - `ok` — everything answered and is within threshold.
+
+        Both `degraded` and `unready` answer 503: staleness and failure
+        both remove the instance from rotation, and the split lives in the
+        body so an operator knows whether to wait or to intervene.
       tags: [Operations]
       security: []
       responses:
         "200":
-          description: Every dependency is usable and ingestion is current
+          description: Every dependency is answering and ingestion is current
           content:
             application/json:
               schema:
@@ -1299,13 +1393,15 @@ paths:
               example:
                 status: ok
                 checks:
-                  database: ok
-                  rpc: ok
-                  ingestion: current
+                  database: {status: ok, latency_ms: 1}
+                  rpc: {status: ok, latency_ms: 84}
+                  ingestion_lag:
+                    status: ok
+                    detail: no ingestion state recorded yet
         "503":
           description: >-
-            A dependency is unusable or ingestion is lagging. The body names
-            the failing check so the instance can be pulled from the load
+            A dependency is degraded or unready. The body names the failing
+            check and its state so the instance can be pulled from the load
             balancer without reading the logs. This is a degraded-readiness
             report rather than the shared error envelope.
           content:
@@ -1315,9 +1411,12 @@ paths:
               example:
                 status: degraded
                 checks:
-                  database: ok
-                  rpc: unavailable
-                  ingestion: lagging (150 ledgers behind)
+                  database: {status: ok, latency_ms: 1}
+                  rpc: {status: ok, latency_ms: 86}
+                  ingestion_lag:
+                    status: degraded
+                    detail: "150 ledgers behind (last ingested: 260000, chain head: 260150)"
+                    latency_ms: 3
   /version:
     get:
       operationId: version
@@ -1492,10 +1591,29 @@ paths:
       operationId: eventsCSV
       summary: Export events as CSV
       description: >-
-        Streaming CSV export of matching events. Pagination controls are
-        intentionally ignored; the server walks the complete result set.
+        Streaming export of matching events, as CSV or NDJSON (`format`).
+        Pagination controls are intentionally ignored; the server walks the
+        complete result set one page at a time, so memory stays flat however
+        large it is.
+
+        The status is committed with the first row, so how an export ended is
+        reported separately. A complete export sets the `X-Export-Status`
+        trailer to `complete` and `X-Export-Rows` to the row count. An export
+        that stops after rows were sent (a store failure, the server's request
+        timeout, the client going away) aborts the connection instead of
+        ending the body, so the client sees a transport error rather than a
+        short file that looks whole. A failure before the first NDJSON row is
+        an ordinary 500. `terminator=true` adds the same end marker in-band.
+
+        CSV cells that a spreadsheet would execute as a formula (a leading
+        `=`, `+`, `@`, tab or carriage return, or a `-` that is not a JSON
+        number) are prefixed with a single quote. Columns are `id`, `ledger`,
+        `type`, `tx_hash`, `topics` and `value`; `topics` and `value` are JSON
+        documents written verbatim into one cell. Rows served count against
+        the tenant's events-served usage.
       tags: [Operations]
       parameters:
+        - $ref: "#/components/parameters/ExportTerminator"
         - $ref: "#/components/parameters/ContractID"
         - $ref: "#/components/parameters/EventType"
         - $ref: "#/components/parameters/Topic"
@@ -1717,6 +1835,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /contracts/{id}/stats:
     get:
       operationId: contractStats
@@ -1777,17 +1897,28 @@ paths:
                           type: integer
                           format: int64
                           description: Number of events of this type
-              example:
-                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
-                name: "Soroban Token"
-                symbol: "STOK"
-                decimals: 7
-                event_count: 42
-                type_breakdown:
-                  - type: contract
-                    count: 38
-                  - type: diagnostic
-                    count: 4
+              examples:
+                token_contract:
+                  summary: Contract with cached token metadata
+                  value:
+                    contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                    name: "Soroban Token"
+                    symbol: "STOK"
+                    decimals: 7
+                    event_count: 42
+                    type_breakdown:
+                      - type: contract
+                        count: 38
+                      - type: diagnostic
+                        count: 4
+                plain_contract:
+                  summary: Contract without cached token metadata
+                  value:
+                    contract_id: "CAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYPSBFLM"
+                    event_count: 19
+                    type_breakdown:
+                      - type: contract
+                        count: 19
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -1798,14 +1929,22 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /contracts/{id}/export:
     get:
       operationId: contractExport
       summary: Export a contract's events
       description: >-
-        Streaming export of every stored event for one contract.
+        Streaming export of every stored event for one contract in a closed
+        ledger range, as CSV or NDJSON (`format`). It streams page by page and
+        reports how it ended exactly as `GET /events.csv` does: the
+        `X-Export-Status` and `X-Export-Rows` trailers on success, an aborted
+        connection when it stops early, and `terminator=true` for an in-band
+        end marker.
       tags: [Operations]
       parameters:
+        - $ref: "#/components/parameters/ExportTerminator"
         - name: id
           in: path
           required: true
@@ -1901,6 +2040,7 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -1927,12 +2067,20 @@ paths:
                     type: object
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     get:
       operationId: getContractSpecOverride
       summary: Get a contract spec override
@@ -1974,6 +2122,8 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       operationId: deleteContractSpecOverride
       summary: Delete a contract spec override
@@ -1992,6 +2142,7 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: The deletion result
@@ -2009,10 +2160,136 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /contracts/{id}/spec/history:
+    get:
+      operationId: listContractSpecOverrideHistory
+      summary: List a contract's spec override history
+      description: >-
+        Lists every recorded change to a contract's spec override, newest
+        first. Each entry records the spec that was in force, the API key
+        prefix that made the change, and when — so "did someone change the
+        override?" has an answer.
+
+        An entry with no `spec` is a tombstone: the override was deleted at
+        that point rather than replaced. The history is append-only and is
+        retained in full; it is never consulted when decoding an event.
+
+        Paginated with an opaque cursor over the version id.
+      tags: [Operations]
+      security:
+        - ManagementKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The contract whose override history is being read.
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of override history, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [versions, count]
+                properties:
+                  versions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ContractSpecOverrideVersion"
+                  count:
+                    type: integer
+                  cursor:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /contracts/{id}/spec/revert:
+    post:
+      operationId: revertContractSpecOverride
+      summary: Restore a previous contract spec override
+      description: >-
+        Restores a previous version of a contract's spec override, named by
+        the `version` in the request body — the id of an entry in the
+        override history.
+
+        The revert is itself a change, so it is recorded as a new history
+        entry: the history stays append-only and keeps the whole sequence,
+        including the way back.
+      tags: [Operations]
+      security:
+        - ManagementKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The contract whose spec override is being restored.
+          schema:
+            type: string
+            pattern: "^C[A-Z2-7]{55}$"
+          example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContractSpecOverrideRevertRequest"
+            example:
+              version: 3
+      responses:
+        "200":
+          description: The restored override
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, spec]
+                properties:
+                  contract_id:
+                    type: string
+                  spec:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /tenant:
     get:
       operationId: currentTenant
@@ -2053,7 +2330,9 @@ paths:
       operationId: currentTenantUsage
       summary: Usage for the calling tenant
       description: >-
-        Recorded request, event-served and stream-time counters for the caller.
+        Recorded request, event-served and stream-time counters for the caller,
+        and how much of its watch-list cap it is using, so a tenant can see it is
+        close before `POST /tenant/watch` starts returning 429.
       tags: [Operations]
       parameters:
         - name: days
@@ -2082,6 +2361,9 @@ paths:
                     requests: 12345
                     events_served: 67890
                     stream_seconds: 3600
+                watched_contracts:
+                  held: 7
+                  limit: 10
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -2136,6 +2418,8 @@ paths:
         Adds a contract to the calling tenant's watch list. The contract must
         be a valid Stellar contract ID; the response is the refreshed list.
       tags: [Operations]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -2159,12 +2443,16 @@ paths:
                   - "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2174,7 +2462,10 @@ paths:
       operationId: removeTenantWatch
       summary: Remove a contract from the tenant's watch list
       description: >-
-        Removes a contract from the calling tenant's watch list.
+        Removes a contract from the calling tenant's watch list. Removing a
+        well-formed contract the tenant does not hold is a no-op that still
+        answers 200 with the unchanged list, so retries stay idempotent; only
+        a malformed contract_id is rejected with a 400.
       tags: [Operations]
       parameters:
         - name: contract_id
@@ -2185,6 +2476,7 @@ paths:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: >-
@@ -2197,12 +2489,16 @@ paths:
               example:
                 contract_ids:
                   - "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2273,6 +2569,7 @@ paths:
             type: string
             enum: ["true"]
           example: "true"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: The newly watched contract and its ingestion frontier.
@@ -2287,8 +2584,12 @@ paths:
                 mode_transition: all_to_specific
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2320,6 +2621,17 @@ paths:
           schema:
             type: string
             enum: ["true"]
+        - name: network
+          in: query
+          description: >-
+            The network whose watch-list entry to remove. Omit to remove
+            from the deployment's configured NETWORK (falling back to
+            "default"). A contract watched on several networks keeps its
+            other entries.
+          schema:
+            type: string
+          example: testnet
+        - $ref: "#/components/parameters/IdempotencyKey"
       security:
         - ManagementKey: []
       responses:
@@ -2340,6 +2652,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2430,6 +2744,7 @@ paths:
             format: int64
             minimum: 1
           example: 42
+        - $ref: "#/components/parameters/IdempotencyKey"
       security:
         - ManagementKey: []
       responses:
@@ -2441,6 +2756,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2485,6 +2802,12 @@ paths:
         The live broadcaster applies contract, event type, topic, ledger/time
         range and has-value filters; pagination and historical-only query
         parameters do not create a replay stream.
+
+        A handshake the websocket library refuses before the upgrade answers
+        with plain text rather than the JSON envelope: 426 when the request is
+        not an upgrade attempt at all (missing Connection/Upgrade headers, or
+        HTTP/1.0), 400 when it is an upgrade attempt with a malformed handshake
+        (unsupported protocol version, or a missing/invalid Sec-WebSocket-Key).
       tags: [Events]
       parameters:
         - $ref: "#/components/parameters/ContractID"
@@ -2504,6 +2827,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "426":
+          $ref: "#/components/responses/UpgradeRequired"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2518,6 +2843,8 @@ paths:
         Register a callback and an event filter. The signing secret is
         returned in the response and must be stored by the caller.
       tags: [Webhooks]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -2550,8 +2877,14 @@ paths:
                 created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2654,6 +2987,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -2681,10 +3015,16 @@ paths:
                 created_at: "2026-07-21T12:00:00Z"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/RequestEntityTooLarge"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2704,6 +3044,7 @@ paths:
             format: int64
             minimum: 1
           example: 1
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: Deleted successfully
@@ -2713,6 +3054,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
         "500":
@@ -2911,16 +3254,16 @@ components:
         a caller asking for more than it may have finds out instead of
         silently receiving a short page and assuming it reached the end.
 
-        The ceiling is 500. An operator can lower it with the API_MAX_LIMIT
-        environment variable, so a deployment may reject a value this schema
-        permits; the store never returns more than 500 rows in one page
-        regardless.
+        The maximum is configurable at deploy time: API_MAX_LIMIT lowers the
+        ceiling to whatever the operator sets, and the store never returns
+        more than 500 rows in one page regardless.
       schema:
         type: integer
         minimum: 1
         maximum: 500
         default: 50
       example: 100
+      default: 50
     ContractsLimit:
       name: limit
       in: query
@@ -3109,6 +3452,19 @@ components:
         type: string
         enum: ["true"]
       example: "true"
+    ExportTerminator:
+      name: terminator
+      in: query
+      description: >-
+        When "true", append an in-band end marker so a consumer that cannot
+        read HTTP trailers can still tell a complete export from a truncated
+        one: a final NDJSON line `{"export":{"complete":true,"rows":N}}`, or
+        a final CSV record `#export-complete,N`. Absent or "false" leaves the
+        rows exactly as before.
+      schema:
+        type: string
+        enum: ["true", "false"]
+        default: "false"
     Pretty:
       name: pretty
       in: query
@@ -3128,6 +3484,21 @@ components:
       schema:
         type: string
       example: '"0001099511627776-0000000001"'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: >-
+        Optional caller-supplied token (up to 255 printable ASCII characters)
+        for safe retries of write operations. Within the 24-hour retention
+        window, repeating the same request with the same key replays the
+        original status and body (`Idempotency-Replayed: true`) without
+        re-running the mutation; reusing the key with a different method,
+        path, or request body returns 409 Conflict (`CONFLICT`).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+      example: "550e8400-e29b-41d4-a716-446655440000"
   headers:
     ETag:
       description: Entity tag for conditional requests and cache validation.
@@ -3191,6 +3562,49 @@ components:
         spec:
           type: object
           description: SEP-0041 contract specification JSON.
+    ContractSpecOverrideRevertRequest:
+      type: object
+      description: >-
+        Names the override-history entry to restore. The id is the one
+        listed by GET /contracts/{id}/spec/history.
+      required: [version]
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: The id of the history entry to restore.
+          example: 3
+    ContractSpecOverrideVersion:
+      type: object
+      description: >-
+        One recorded change to a contract's spec override. The spec is
+        absent for a tombstone entry, which means the override was deleted
+        at that point rather than replaced.
+      required: [id, contract_id, api_key_prefix, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: The version number. It is also the pagination cursor.
+        contract_id:
+          type: string
+          description: The contract whose override changed.
+        spec:
+          type: object
+          description: >-
+            The override document that was in force. Absent for a tombstone
+            entry.
+        api_key_prefix:
+          type: string
+          description: >-
+            The public prefix of the API key that made the change. The
+            secret half of the key is never stored.
+        created_at:
+          type: string
+          format: date-time
+          description: When the change was recorded.
     ErrorResponse:
       type: object
       description: Standard error envelope
@@ -3198,21 +3612,75 @@ components:
         error:
           type: string
           description: Human-readable error message
-      required: [error]
+        code:
+          type: string
+          description: Stable machine-readable error code
+          enum:
+            - INVALID_PARAMETER
+            - INVALID_CURSOR
+            - RANGE_TOO_WIDE
+            - LIMIT_EXCEEDED
+            - INVALID_BODY
+            - CONFIRMATION_REQUIRED
+            - UNAUTHORIZED
+            - FORBIDDEN
+            - NOT_FOUND
+            - CONFLICT
+            - PAYLOAD_TOO_LARGE
+            - QUOTA_EXCEEDED
+            - RATE_LIMITED
+            - INTERNAL_ERROR
+            - UNSUPPORTED_OPERATION
+            - SERVICE_UNAVAILABLE
+        field:
+          type: string
+          description: Request parameter or JSON field that caused a validation error
+      required: [error, code]
     HealthResponse:
       type: object
+      description: >-
+        Envelope shared by /health, /livez and /readyz. status aggregates
+        the checks: unready dominates degraded, which dominates ok.
       properties:
         status:
           type: string
-          enum: [ok, degraded]
+          enum: [ok, degraded, unready]
         checks:
           type: object
+          description: >-
+            One entry per dependency the endpoint consulted; empty of
+            dependency entries on /livez, which reports only `process`.
           additionalProperties:
-            type: string
+            $ref: "#/components/schemas/DependencyCheck"
           example:
-            database: ok
-            rpc: ok
+            database: {status: ok, latency_ms: 1}
+            rpc: {status: ok, latency_ms: 84}
       required: [status, checks]
+    DependencyCheck:
+      type: object
+      description: >-
+        One dependency's state inside a health envelope: what state it is
+        in, why it isn't ok, and how long its own probe took.
+      properties:
+        status:
+          type: string
+          description: >-
+            `ok` — answered within its budget and healthy. `degraded` —
+            answered, but reports a suboptimal state (a non-healthy RPC,
+            or ingestion past the lag threshold). `unready` — did not
+            answer at all: it errored or exceeded its per-check timeout.
+          enum: [ok, degraded, unready]
+          example: ok
+        detail:
+          type: string
+          description: Human-readable cause, present only when status is not ok.
+          example: "150 ledgers behind (last ingested: 260000, chain head: 260150)"
+        latency_ms:
+          type: integer
+          format: int64
+          description: Wall time of this check alone, in milliseconds.
+          example: 84
+      required: [status, latency_ms]
     Event:
       type: object
       description: A Stellar/Soroban contract event
@@ -3540,14 +4008,52 @@ components:
         stream_seconds:
           type: integer
           format: int64
+    WatchHeadroom:
+      type: object
+      description: >-
+        How much of a watch-list cap is in use. `limit` is null when there is
+        no cap.
+      required: [held, limit]
+      properties:
+        held:
+          type: integer
+          minimum: 0
+          example: 7
+        limit:
+          type: integer
+          nullable: true
+          minimum: 0
+          example: 10
     UsagePage:
       type: object
-      required: [usage]
+      required: [usage, watched_contracts]
       properties:
         usage:
           type: array
           items:
             $ref: "#/components/schemas/TenantUsage"
+        watched_contracts:
+          allOf:
+            - $ref: "#/components/schemas/WatchHeadroom"
+          description: >-
+            The tenant's own watch list: contracts held against its
+            `max_watched_contracts`. `POST /tenant/watch` returns 429 once
+            `held` reaches `limit`; a null `limit` means the tenant has no cap
+            of its own (the instance-wide cap still applies).
+        instance_watch_list_full:
+          type: boolean
+          description: >-
+            Tenant view only, and only when the instance has a watch-list cap.
+            True when the instance-wide watch list is full, so adding a contract
+            that no tenant already watches would be refused. The instance total
+            is deliberately not given: it is aggregate usage across every tenant.
+        instance_watched_contracts:
+          allOf:
+            - $ref: "#/components/schemas/WatchHeadroom"
+          description: >-
+            Admin view only (`GET /admin/tenants/{id}/usage`): distinct
+            contracts watched across the whole instance against
+            `MULTI_TENANT_MAX_WATCHED`.
     TenantAPIKey:
       type: object
       description: Tenant API key metadata; secret is returned only on creation.
@@ -3622,6 +4128,17 @@ components:
           format: int32
           minimum: 0
           description: Maximum number of contracts this tenant may watch.
+        retention_max_age_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 3153600000
+          description: >-
+            The tenant's event-retention horizon in seconds. Omit or send 0
+            to inherit the instance default (RETENTION_MAX_AGE). A shared
+            contract's events are kept for the longest horizon among the
+            tenants entitled to it, and each tenant reads only within its
+            own horizon. See docs/multi-tenancy.md#retention.
     TenantUpdateRequest:
       type: object
       description: >-
@@ -3659,6 +4176,21 @@ components:
           format: int32
           minimum: 0
           description: Maximum number of contracts this tenant may watch.
+        retention_max_age_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 3153600000
+          description: >-
+            Replacement event-retention horizon in seconds; 0 clears the
+            override so the tenant inherits the instance default again.
+        confirm_retention_shortening:
+          type: boolean
+          default: false
+          description: >-
+            Must be true when the update shortens the tenant's effective
+            retention horizon. Shortening is irreversible once the next prune
+            sweep runs, so without it the request is refused with 409.
     GrantContractRequest:
       type: object
       description: JSON body used to grant one contract to a tenant.
@@ -3691,6 +4223,14 @@ components:
           pattern: "^C[A-Z2-7]{55}$"
           description: Stellar contract ID to add to the watch list.
           example: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        network:
+          type: string
+          description: >-
+            The Stellar network this entry is watched on. Omit to file the
+            contract on the deployment's configured NETWORK (falling back
+            to "default" when that is unset). The same contract watched on
+            two networks is two independent watch-list entries.
+          example: testnet
     Tenant:
       type: object
       description: Tenant identity, access scope and quota configuration.
@@ -3722,6 +4262,14 @@ components:
           oneOf:
             - type: integer
               format: int32
+            - type: "null"
+        retention_max_age_seconds:
+          description: >-
+            The tenant's own event-retention horizon in seconds. Absent or
+            null means it inherits the instance default.
+          oneOf:
+            - type: integer
+              format: int64
             - type: "null"
         created_at:
           type: string
@@ -3779,6 +4327,13 @@ components:
         contract_id:
           type: string
           pattern: "^C[A-Z2-7]{55}$"
+        network:
+          type: string
+          description: >-
+            The network this entry is watched on. Always present in
+            responses; entries written without a network are reported as
+            "default".
+          example: testnet
         added_at:
           type: string
           format: date-time
@@ -3797,11 +4352,14 @@ components:
     WatchedContractAdded:
       type: object
       description: Result of adding a contract to the global watch list.
-      required: [contract_id, added_at, history_from_ledger]
+      required: [contract_id, network, added_at, history_from_ledger]
       properties:
         contract_id:
           type: string
           pattern: "^C[A-Z2-7]{55}$"
+        network:
+          type: string
+          description: The network the entry was filed on (echoes the request's network or the deployment default).
         added_at:
           type: string
           format: date-time
@@ -3814,11 +4372,14 @@ components:
     WatchedContractRemoved:
       type: object
       description: Result of removing a contract from the global watch list.
-      required: [contract_id, removed_at, history_preserved]
+      required: [contract_id, network, removed_at, history_preserved]
       properties:
         contract_id:
           type: string
           pattern: "^C[A-Z2-7]{55}$"
+        network:
+          type: string
+          description: The network the entry was removed from.
         removed_at:
           type: string
           format: date-time
@@ -4103,9 +4664,19 @@ components:
     BadRequest:
       description: >-
         The request could not be parsed or violates a documented constraint —
-        a malformed identifier, an out-of-range limit, an unparseable cursor,
-        or a JSON body the endpoint cannot decode. The message names the
-        offending parameter.
+        a malformed identifier (`INVALID_PARAMETER`), an out-of-range limit
+        (`LIMIT_EXCEEDED`), an overly wide export span (`RANGE_TOO_WIDE`), an
+        unparseable or mismatched cursor (`INVALID_CURSOR`), a missing
+        ingestion-mode confirmation (`CONFIRMATION_REQUIRED`), or a JSON body
+        the endpoint cannot decode (`INVALID_BODY`). The `field` property names
+        the offending parameter when applicable.
+      x-error-codes:
+        - INVALID_PARAMETER
+        - INVALID_CURSOR
+        - RANGE_TOO_WIDE
+        - LIMIT_EXCEEDED
+        - INVALID_BODY
+        - CONFIRMATION_REQUIRED
       content:
         application/json:
           schema:
@@ -4113,12 +4684,14 @@ components:
     Unauthorized:
       description: |
         No credential was presented, or the one presented is malformed,
-        unknown or revoked.
+        unknown or revoked (`UNAUTHORIZED`).
 
         Which credential is missing depends on the endpoint's security
         requirement: endpoints requiring ManagementKey want the operator's
         `X-API-Key`, while everything else wants the tenant key and only
         rejects when the instance runs with MULTI_TENANT=true.
+      x-error-codes:
+        - UNAUTHORIZED
       headers:
         WWW-Authenticate:
           description: >-
@@ -4136,10 +4709,12 @@ components:
     Forbidden:
       description: >-
         The credential is valid but does not entitle the caller to what it
-        asked for: a disabled tenant, a non-admin calling an admin endpoint,
-        or a request naming a contract outside the tenant's grants. Contract
-        IDs are public on-chain identifiers, so a request for an ungranted
-        contract is answered 403 rather than 404.
+        asked for (`FORBIDDEN`): a disabled tenant, a non-admin calling an
+        admin endpoint, or a request naming a contract outside the tenant's
+        grants. Contract IDs are public on-chain identifiers, so a request for
+        an ungranted contract is answered 403 rather than 404.
+      x-error-codes:
+        - FORBIDDEN
       content:
         application/json:
           schema:
@@ -4147,27 +4722,46 @@ components:
     NotFound:
       description: >-
         The addressed resource does not exist, or is not visible to the
-        caller. Event lookups answer 404 rather than 403 for an event the
-        caller may not read, so the endpoint cannot be used as an existence
-        oracle. The tenant and admin endpoints also answer 404 when the
-        instance runs single-tenant and those routes are therefore inert.
+        caller (`NOT_FOUND`). Event lookups answer 404 rather than 403 for an
+        event the caller may not read, so the endpoint cannot be used as an
+        existence oracle. The tenant and admin endpoints also answer 404 when
+        the instance runs single-tenant and those routes are therefore inert.
+      x-error-codes:
+        - NOT_FOUND
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     Conflict:
       description: >-
-        The request collides with the current state — a duplicate tenant
-        name, or a tenant attempting to delete the account it is
-        authenticated as.
+        The request collides with the current state (`CONFLICT`) — a duplicate
+        tenant name, a tenant attempting to delete the account it is
+        authenticated as, or an `Idempotency-Key` reused with a different
+        method, path, or request body within its retention window.
+      x-error-codes:
+        - CONFLICT
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    UpgradeRequired:
+      description: >-
+        The websocket handshake was refused before the upgrade because the
+        request is not a valid upgrade attempt: HTTP/1.0, or the Connection
+        and Upgrade headers are missing or do not name `websocket`. Only
+        `/events/ws` can answer this, and — unlike every other error here —
+        the body is plain text written by the websocket library, not the JSON
+        envelope.
+      content:
+        text/plain:
+          schema:
+            type: string
+            examples:
+              - 'WebSocket protocol violation: Connection header "" does not contain Upgrade'
     TooManyRequests:
       description: |
-        The caller exceeded its request quota, or asked to watch more
-        contracts than its quota allows.
+        The caller exceeded its request quota (`RATE_LIMITED`), or asked to
+        watch more contracts than its quota allows (`QUOTA_EXCEEDED`).
 
         Rate limiting is per client — keyed on the authenticated tenant where
         one exists and on the client IP otherwise — and is only active when
@@ -4175,6 +4769,9 @@ components:
         probe and scrape endpoints (/health, /livez, /readyz, /metrics) are
         never rate limited, so throttling cannot blind an operator to the
         throttling itself.
+      x-error-codes:
+        - QUOTA_EXCEEDED
+        - RATE_LIMITED
       headers:
         Retry-After:
           description: >-
@@ -4185,16 +4782,49 @@ components:
             type: integer
             minimum: 1
             examples: [1]
+        X-RateLimit-Limit:
+          description: The caller's configured burst capacity.
+          schema:
+            type: integer
+            minimum: 1
+            examples: [20]
+        X-RateLimit-Remaining:
+          description: The caller's remaining request budget; always 0 on a 429.
+          schema:
+            type: integer
+            minimum: 0
+            examples: [0]
+        X-RateLimit-Reset:
+          description: >-
+            Unix timestamp in seconds when the next request token is expected
+            to become available, or the quota window resets.
+          schema:
+            type: integer
+            format: int64
+            examples: [1792512000]
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    RequestEntityTooLarge:
+      description: >-
+        The request body exceeds the instance's configured limit
+        (HTTP_REQUEST_BODY_LIMIT, `PAYLOAD_TOO_LARGE`). Reduce the body size
+        and retry.
+      x-error-codes:
+        - PAYLOAD_TOO_LARGE
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     InternalError:
       description: >-
-        The request failed for a reason the caller cannot act on — a store or
-        RPC failure, or a panic caught by the recovery middleware. The
-        message is deliberately generic; the specifics are logged against the
-        request's X-Request-ID rather than returned.
+        The request failed for a reason the caller cannot act on
+        (`INTERNAL_ERROR`) — a store or RPC failure, or a panic caught by the
+        recovery middleware. The message is deliberately generic; the specifics
+        are logged against the request's X-Request-ID rather than returned.
+      x-error-codes:
+        - INTERNAL_ERROR
       content:
         application/json:
           schema:
@@ -4202,8 +4832,11 @@ components:
     NotImplemented:
       description: >-
         The endpoint exists but the feature behind it is not configured on
-        this instance. Returned by the live event stream when the broadcaster
-        is disabled.
+        this instance (`UNSUPPORTED_OPERATION`). Returned by the live event
+        stream when the broadcaster is disabled, or when the store backend
+        does not implement the capability.
+      x-error-codes:
+        - UNSUPPORTED_OPERATION
       content:
         application/json:
           schema:
@@ -4211,9 +4844,12 @@ components:
     ServiceUnavailable:
       description: >-
         The endpoint is temporarily unusable or not configured on this
-        instance. The management endpoints answer this when API_KEY is unset,
-        failing closed so writes are never open on a misconfigured instance;
-        /metrics answers it when no metrics collector is wired in.
+        instance (`SERVICE_UNAVAILABLE`). The management endpoints answer this
+        when API_KEY is unset, failing closed so writes are never open on a
+        misconfigured instance; /metrics answers it when no metrics collector
+        is wired in.
+      x-error-codes:
+        - SERVICE_UNAVAILABLE
       content:
         application/json:
           schema:

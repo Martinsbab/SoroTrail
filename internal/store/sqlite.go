@@ -3,11 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -17,7 +18,59 @@ import (
 // It uses WAL journal mode and a 5-second busy timeout to allow concurrent
 // readers during ingestion writes.
 type SQLite struct {
-	db *sql.DB
+	db                        *sql.DB
+	maxSparseFilterLedgerSpan atomic.Int64
+	fieldEncryptor            atomic.Pointer[FieldEncryptor]
+}
+
+// SetFieldEncryptor configures the FieldEncryptor used to encrypt and decrypt
+// sensitive columns at rest (such as subscriptions.secret).
+func (s *SQLite) SetFieldEncryptor(enc *FieldEncryptor) {
+	if s == nil {
+		return
+	}
+	s.fieldEncryptor.Store(enc)
+}
+
+// FieldEncryptor returns the configured FieldEncryptor, or nil if field-level
+// encryption is not enabled.
+func (s *SQLite) FieldEncryptor() *FieldEncryptor {
+	if s == nil {
+		return nil
+	}
+	return s.fieldEncryptor.Load()
+}
+
+// VerifyEncryptionReadiness checks stored subscriptions.secret rows at startup
+// to verify that if any encrypted rows exist, the configured FieldEncryptor
+// contains every required key version and can authenticate a sample row for each.
+func (s *SQLite) VerifyEncryptionReadiness(ctx context.Context) error {
+	return VerifySQLStoreEncryptionReadiness(ctx, s.db, s.FieldEncryptor())
+}
+
+// RotateSubscriptionsEncryption scans subscriptions.secret in bounded batches,
+// encrypting legacy plaintext rows and re-encrypting rows on older key versions
+// to the active key version with fresh random nonces.
+func (s *SQLite) RotateSubscriptionsEncryption(ctx context.Context, batchSize int) (EncryptionRotationStats, error) {
+	return RotateSQLSubscriptionsEncryption(ctx, s.db, s.FieldEncryptor(), batchSize)
+}
+
+// SetMaxSparseFilterLedgerSpan configures the maximum ledger span allowed
+// when querying sparse JSONB topic filters on SQLite.QueryEvents.
+func (s *SQLite) SetMaxSparseFilterLedgerSpan(maxSpan int64) {
+	if s == nil {
+		return
+	}
+	s.maxSparseFilterLedgerSpan.Store(maxSpan)
+}
+
+// MaxSparseFilterLedgerSpan returns the currently configured maximum ledger
+// span for sparse JSONB topic filters.
+func (s *SQLite) MaxSparseFilterLedgerSpan() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.maxSparseFilterLedgerSpan.Load()
 }
 
 var _ Store = (*SQLite)(nil)
@@ -271,12 +324,23 @@ func (s *SQLite) GetEventsByTxHash(ctx context.Context, txHash, excludeID string
 }
 
 func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, string, error) {
+	if err := ValidateSparseFilterRange(f, s.MaxSparseFilterLedgerSpan()); err != nil {
+		return nil, "", err
+	}
+	if !ValidOrderBy(f.OrderBy) {
+		return nil, "", fmt.Errorf("unsupported order_by %q", f.OrderBy)
+	}
+
 	limit := f.Limit
 	if limit <= 0 {
 		limit = DefaultQueryLimit
 	}
 	if limit > MaxQueryLimit {
 		limit = MaxQueryLimit
+	}
+
+	if !ValidOrderBy(f.OrderBy) {
+		return nil, "", fmt.Errorf("%w: unsupported order_by %q", ErrInvalidCursor, f.OrderBy)
 	}
 
 	var (
@@ -287,11 +351,41 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 		args = append(args, v)
 		return "?"
 	}
+	if len(f.Scope.Contracts()) > 0 {
+		contracts := f.Scope.Contracts()
+		ph := make([]string, 0, len(contracts))
+		for _, cid := range contracts {
+			ph = append(ph, arg(cid))
+		}
+		where = append(where, "contract_id IN ("+strings.Join(ph, ", ")+")")
+	}
 	if f.Network != "" {
 		where = append(where, "network = "+arg(defaultNetwork(f.Network)))
 	}
-	if f.ContractID != "" {
+	if len(f.ContractIDs) > 0 {
+		ids := f.ContractIDs
+		if f.ContractID != "" {
+			has := false
+			for _, id := range ids {
+				if id == f.ContractID {
+					has = true
+					break
+				}
+			}
+			if !has {
+				ids = append(ids, f.ContractID)
+			}
+		}
+		ph := make([]string, 0, len(ids))
+		for _, id := range ids {
+			ph = append(ph, arg(id))
+		}
+		where = append(where, "contract_id IN ("+strings.Join(ph, ", ")+")")
+	} else if f.ContractID != "" {
 		where = append(where, "contract_id = "+arg(f.ContractID))
+	}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
 	}
 	if len(f.Types) > 0 {
 		// SQLite has no ANY(); expand to an IN list.
@@ -300,6 +394,12 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 			ph = append(ph, arg(t))
 		}
 		where = append(where, "type IN ("+strings.Join(ph, ", ")+")")
+	}
+	if f.TxHash != "" {
+		where = append(where, "tx_hash = "+arg(f.TxHash))
+	}
+	if f.InSuccessfulCall != nil {
+		where = append(where, "in_successful_call = "+arg(*f.InSuccessfulCall))
 	}
 	if len(f.Topic) > 0 {
 		where = append(where, topicContainsExpr(arg(f.Topic)))
@@ -337,19 +437,63 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 
 	orderDir := "ASC"
 	cursorOp := ">"
+	ledgerBoundOp := ">="
 	if f.Order == "desc" {
 		orderDir = "DESC"
 		cursorOp = "<"
+		ledgerBoundOp = "<="
 	}
+	orderCols := "id " + orderDir
+	if f.OrderBy != "" && f.OrderBy != OrderByID {
+		orderCols = f.OrderBy + " " + orderDir + ", id " + orderDir
+	}
+
 	if f.Cursor != "" {
-		where = append(where, "id "+cursorOp+" "+arg(f.Cursor))
+		switch f.OrderBy {
+		case "", OrderByID:
+			cursorID, err := DecodeEventIDCursorForBackend(CursorBackendSQLite, f.Cursor)
+			if err != nil {
+				return nil, "", err
+			}
+			if cursorLedger, ok := CursorLedger(cursorID); ok {
+				if (f.FromLedger <= 0 || cursorLedger >= f.FromLedger) &&
+					(f.ToLedger <= 0 || cursorLedger <= f.ToLedger) {
+					where = append(where, "ledger "+ledgerBoundOp+" "+arg(cursorLedger))
+				}
+			}
+			where = append(where, "id "+cursorOp+" "+arg(cursorID))
+		default:
+			sortValue, id, err := decodeCompositeCursorForBackend(CursorBackendSQLite, f.Cursor)
+			if err != nil {
+				return nil, "", err
+			}
+			switch f.OrderBy {
+			case OrderByLedger:
+				cursorLedger, perr := strconv.ParseInt(sortValue, 10, 64)
+				if perr != nil {
+					return nil, "", fmt.Errorf("%w: %w: ledger cursor sort value is not an integer", ErrInvalidCursor, ErrStaleCursor)
+				}
+				where = append(where, "ledger "+ledgerBoundOp+" "+arg(cursorLedger))
+				where = append(where, fmt.Sprintf("(ledger, id) %s (%s, %s)",
+					cursorOp, arg(cursorLedger), arg(id)))
+			case OrderByCreatedAt:
+				t, perr := time.Parse(time.RFC3339Nano, sortValue)
+				if perr != nil {
+					return nil, "", fmt.Errorf("%w: %w: created_at cursor sort value is not RFC3339Nano", ErrInvalidCursor, ErrStaleCursor)
+				}
+				formatted := formatTime(t)
+				where = append(where, "created_at "+ledgerBoundOp+" "+arg(formatted))
+				where = append(where, fmt.Sprintf("(created_at, id) %s (%s, %s)",
+					cursorOp, arg(formatted), arg(id)))
+			}
+		}
 	}
 
 	query := `SELECT ` + eventColumnsSQLite + ` FROM events`
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	query += " ORDER BY id " + orderDir + " LIMIT " + arg(limit+1)
+	query += " ORDER BY " + orderCols + " LIMIT " + arg(limit+1)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -372,7 +516,7 @@ func (s *SQLite) QueryEvents(ctx context.Context, f EventFilter) ([]Event, strin
 	next := ""
 	if len(events) > limit {
 		events = events[:limit]
-		next = events[limit-1].ID
+		next = EncodeCursorForBackend(CursorBackendSQLite, f.OrderBy, events[limit-1])
 	}
 	return events, next, nil
 }
@@ -594,7 +738,11 @@ func (s *SQLite) QueryAddressEvents(ctx context.Context, address string, f Event
 	orderCols := "e.id " + orderDir
 
 	if f.Cursor != "" {
-		where = append(where, "e.id "+cursorOp+" "+arg(f.Cursor))
+		cursorID, err := DecodeEventIDCursorForBackend(CursorBackendSQLite, f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		where = append(where, "e.id "+cursorOp+" "+arg(cursorID))
 	}
 
 	query := `SELECT ` + eventColumnsSQLite + `
@@ -718,11 +866,11 @@ func (s *SQLite) ListDeadLetters(ctx context.Context, contractID string, limit i
 		where = append(where, "contract_id = "+arg(contractID))
 	}
 	if cursor != "" {
-		sv, err := base64.RawURLEncoding.DecodeString(cursor)
+		afterID, err := DecodeDeadLetterCursorForBackend(CursorBackendSQLite, cursor)
 		if err != nil {
-			return nil, "", fmt.Errorf("%w: dead letter cursor", ErrInvalidContractsCursor)
+			return nil, "", err
 		}
-		where = append(where, "dead_letters.id < "+arg(string(sv)))
+		where = append(where, "dead_letters.id < "+arg(strconv.FormatInt(afterID, 10)))
 	}
 	query := "SELECT id, event_id, contract_id, ledger, type, tx_hash, topic_xdr, value_xdr, error, attempts, last_attempt, created_at FROM dead_letters"
 	if len(where) > 0 {
@@ -758,7 +906,7 @@ func (s *SQLite) ListDeadLetters(ctx context.Context, contractID string, limit i
 	next := ""
 	if len(letters) > limit {
 		letters = letters[:limit]
-		next = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d", letters[limit-1].ID)))
+		next = EncodeDeadLetterCursorForBackend(CursorBackendSQLite, letters[limit-1].ID)
 	}
 	return letters, next, nil
 }
@@ -808,9 +956,12 @@ func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (DeadLetter, error
 }
 
 func (s *SQLite) DeleteDeadLetter(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM dead_letters WHERE id = ?", id)
+	res, err := s.db.ExecContext(ctx, "DELETE FROM dead_letters WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("deleting dead letter: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -973,19 +1124,20 @@ func (s *SQLite) SaveIngestionState(ctx context.Context, st IngestionState) erro
 	return nil
 }
 
-func (s *SQLite) GetAuditState(ctx context.Context, _ string) (AuditState, error) {
+func (s *SQLite) GetAuditState(ctx context.Context, network string) (AuditState, error) {
 	var (
 		st AuditState
 		ts string
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT verified_through_ledger, updated_at FROM audit_state WHERE id = 1`,
-	).Scan(&st.VerifiedThroughLedger, &ts)
+		`SELECT network, verified_through_ledger, updated_at FROM audit_state WHERE network = ?`,
+		defaultNetwork(network),
+	).Scan(&st.Network, &st.VerifiedThroughLedger, &ts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuditState{}, ErrNotFound
 	}
 	if err != nil {
-		return AuditState{}, fmt.Errorf("loading audit state: %w", err)
+		return AuditState{}, fmt.Errorf("loading audit state for network %q: %w", network, err)
 	}
 	st.UpdatedAt = parseTime(ts)
 	return st, nil
@@ -994,50 +1146,58 @@ func (s *SQLite) GetAuditState(ctx context.Context, _ string) (AuditState, error
 func (s *SQLite) SaveAuditState(ctx context.Context, st AuditState) error {
 	now := formatTime(time.Now().UTC())
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
-		VALUES (1, ?, ?)
-		ON CONFLICT (id) DO UPDATE SET
+		INSERT INTO audit_state (network, verified_through_ledger, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT (network) DO UPDATE SET
 			verified_through_ledger = excluded.verified_through_ledger,
 			updated_at              = excluded.updated_at`,
-		st.VerifiedThroughLedger, now,
+		defaultNetwork(st.Network), st.VerifiedThroughLedger, now,
 	)
 	if err != nil {
-		return fmt.Errorf("saving audit state: %w", err)
+		return fmt.Errorf("saving audit state for network %q: %w", st.Network, err)
 	}
 	return nil
 }
 
-func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, _ string, ledger int64) (AuditState, error) {
+func (s *SQLite) SaveAuditStateIfGreater(ctx context.Context, network string, ledger int64) (AuditState, error) {
 	now := formatTime(time.Now().UTC())
+	network = defaultNetwork(network)
 
-	// First INSERT will succeed when the table is empty.
+	// First INSERT will succeed when the table has no row for this network.
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO audit_state (id, verified_through_ledger, updated_at)
-		VALUES (1, ?, ?)`,
-		ledger, now)
+		INSERT INTO audit_state (network, verified_through_ledger, updated_at)
+		VALUES (?, ?, ?)`,
+		network, ledger, now)
 	if err == nil {
-		return AuditState{VerifiedThroughLedger: ledger, UpdatedAt: time.Now().UTC()}, nil
+		return AuditState{Network: network, VerifiedThroughLedger: ledger, UpdatedAt: time.Now().UTC()}, nil
 	}
 
 	// Row exists — update only when the candidate is greater than the stored value.
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE audit_state
 		SET verified_through_ledger = ?, updated_at = ?
-		WHERE id = 1 AND ? > verified_through_ledger`,
-		ledger, now, ledger)
+		WHERE network = ? AND ? > verified_through_ledger`,
+		ledger, now, network, ledger)
 	if err != nil {
 		return AuditState{}, fmt.Errorf("saving audit state (if greater): %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		return s.GetAuditState(ctx, "")
+		return s.GetAuditState(ctx, network)
 	}
 	// Candidate was not greater — return the current stored state.
-	return s.GetAuditState(ctx, "")
+	return s.GetAuditState(ctx, network)
 }
 
 func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT contract_id FROM watched_contracts ORDER BY contract_id`)
+	return s.ListWatchedContractsScoped(ctx, WildcardScope())
+}
+
+func (s *SQLite) ListWatchedContractsScoped(ctx context.Context, sc Scope) ([]WatchedContract, error) {
+	if sc.DeniesAll() {
+		return []WatchedContract{}, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT network, contract_id FROM watched_contracts ORDER BY network, contract_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing watched contracts: %w", err)
 	}
@@ -1045,27 +1205,30 @@ func (s *SQLite) ListWatchedContracts(ctx context.Context) ([]WatchedContract, e
 	var out []WatchedContract
 	for rows.Next() {
 		var wc WatchedContract
-		if err := rows.Scan(&wc.ContractID); err != nil {
+		if err := rows.Scan(&wc.Network, &wc.ContractID); err != nil {
 			return nil, err
 		}
-		out = append(out, wc)
+		if sc.Allows(wc.ContractID) {
+			out = append(out, wc)
+		}
 	}
 	return out, rows.Err()
 }
 
-func (s *SQLite) AddWatchedContract(ctx context.Context, contractID string) error {
+func (s *SQLite) AddWatchedContract(ctx context.Context, w WatchedContract) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO watched_contracts (contract_id) VALUES (?)
-		ON CONFLICT (contract_id) DO NOTHING`, contractID)
+		INSERT INTO watched_contracts (network, contract_id) VALUES (?, ?)
+		ON CONFLICT (network, contract_id) DO NOTHING`, defaultNetwork(w.Network), w.ContractID)
 	if err != nil {
 		return fmt.Errorf("adding watched contract: %w", err)
 	}
 	return nil
 }
 
-func (s *SQLite) RemoveWatchedContract(ctx context.Context, contractID string) error {
+func (s *SQLite) RemoveWatchedContract(ctx context.Context, w WatchedContract) error {
 	result, err := s.db.ExecContext(ctx,
-		`DELETE FROM watched_contracts WHERE contract_id = ?`, contractID)
+		`DELETE FROM watched_contracts WHERE network = ? AND contract_id = ?`,
+		defaultNetwork(w.Network), w.ContractID)
 	if err != nil {
 		return fmt.Errorf("removing watched contract: %w", err)
 	}
@@ -1082,18 +1245,24 @@ func (s *SQLite) RecordAuditFinding(ctx context.Context, f AuditFinding) (AuditF
 		b, _ := json.Marshal(f.MissingIDs)
 		missingIDs = string(b)
 	}
+	// created_at returns as a driver string, not a time.Time: SQLite's
+	// column default is a strftime expression and the driver does not
+	// convert it, so the scan goes through the shared parseTime helper
+	// exactly like every other read of this column.
+	var createdAt string
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO audit_findings
-			(from_ledger, to_ledger, expected_count, actual_count,
+			(network, from_ledger, to_ledger, expected_count, actual_count,
 			 missing_ids, status, attempts)
-		VALUES (?, ?, ?, ?, ?, ?, 0)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0)
 		RETURNING id, created_at`,
-		f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
+		defaultNetwork(f.Network), f.FromLedger, f.ToLedger, f.ExpectedCount, f.ActualCount,
 		missingIDs, f.Status,
-	).Scan(&f.ID, &f.CreatedAt)
+	).Scan(&f.ID, &createdAt)
 	if err != nil {
 		return AuditFinding{}, fmt.Errorf("recording audit finding: %w", err)
 	}
+	f.CreatedAt = parseTime(createdAt)
 	return f, nil
 }
 
@@ -1123,17 +1292,18 @@ func (s *SQLite) UpdateAuditFinding(ctx context.Context, f AuditFinding) error {
 	return nil
 }
 
-func (s *SQLite) ListOpenFindingsByRange(ctx context.Context, _ string, fromLedger, toLedger int64) (AuditFinding, error) {
+func (s *SQLite) ListOpenFindingsByRange(ctx context.Context, network string, fromLedger, toLedger int64) (AuditFinding, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, from_ledger, to_ledger, expected_count, actual_count,
+		SELECT id, network, from_ledger, to_ledger, expected_count, actual_count,
 		       missing_ids, status, attempts, last_attempted_at, last_error, created_at
 		FROM audit_findings
-		WHERE status IN ('open', 'unrecoverable')
+		WHERE network = ?
+		  AND status IN ('open', 'unrecoverable')
 		  AND from_ledger <= ?
 		  AND to_ledger   >= ?
 		ORDER BY id DESC
 		LIMIT 1`,
-		toLedger, fromLedger,
+		defaultNetwork(network), toLedger, fromLedger,
 	)
 	return scanAuditFinding(row)
 }
@@ -1146,7 +1316,7 @@ func scanAuditFinding(row *sql.Row) (AuditFinding, error) {
 		missingIDs    string
 		createdAt     string
 	)
-	err := row.Scan(&f.ID, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
+	err := row.Scan(&f.ID, &f.Network, &f.FromLedger, &f.ToLedger, &f.ExpectedCount, &f.ActualCount,
 		&missingIDs, &f.Status, &f.Attempts, &lastAttempted, &lastError, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuditFinding{}, ErrNotFound
@@ -1170,22 +1340,28 @@ func (s *SQLite) CreateSubscription(ctx context.Context, sub Subscription) (Subs
 	if err != nil {
 		return Subscription{}, fmt.Errorf("marshaling subscription filters: %w", err)
 	}
+	storedSecret, err := encryptSubscriptionSecret(s.FieldEncryptor(), sub.Secret)
+	if err != nil {
+		return Subscription{}, fmt.Errorf("encrypting subscription secret: %w", err)
+	}
+	var createdAt string
 	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO subscriptions (url, filters, secret, enabled)
 		VALUES (?, ?, ?, ?)
 		RETURNING id, failure_count, created_at`,
-		sub.URL, filtersJSON, sub.Secret, sub.Enabled,
-	).Scan(&sub.ID, &sub.FailureCount, &sub.CreatedAt)
+		sub.URL, string(filtersJSON), storedSecret, sub.Enabled,
+	).Scan(&sub.ID, &sub.FailureCount, &createdAt)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("creating subscription: %w", err)
 	}
+	sub.CreatedAt = parseTime(createdAt)
 	return sub, nil
 }
 
 func (s *SQLite) GetSubscription(ctx context.Context, id int64, _ SubscriptionOwner) (Subscription, error) {
 	return scanSubscription(s.db.QueryRowContext(ctx, `
 		SELECT id, url, filters, secret, enabled, failure_count, created_at
-		FROM subscriptions WHERE id = ?`, id))
+		FROM subscriptions WHERE id = ?`, id), s.FieldEncryptor())
 }
 
 func (s *SQLite) ListSubscriptions(ctx context.Context, _ SubscriptionOwner) ([]Subscription, error) {
@@ -1196,13 +1372,17 @@ func (s *SQLite) ListSubscriptions(ctx context.Context, _ SubscriptionOwner) ([]
 		return nil, fmt.Errorf("listing subscriptions: %w", err)
 	}
 	defer rows.Close()
-	return scanSubscriptionsSQLite(rows)
+	return scanSubscriptionsSQLite(rows, s.FieldEncryptor())
 }
 
 func (s *SQLite) UpdateSubscription(ctx context.Context, sub Subscription, _ SubscriptionOwner) (Subscription, error) {
 	filtersJSON, err := json.Marshal(sub.Filters)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("marshaling subscription filters: %w", err)
+	}
+	storedSecret, err := encryptSubscriptionSecret(s.FieldEncryptor(), sub.Secret)
+	if err != nil {
+		return Subscription{}, fmt.Errorf("encrypting subscription %d secret: %w", sub.ID, err)
 	}
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE subscriptions SET
@@ -1211,7 +1391,7 @@ func (s *SQLite) UpdateSubscription(ctx context.Context, sub Subscription, _ Sub
 			secret  = ?,
 			enabled = ?
 		WHERE id = ?`,
-		sub.URL, filtersJSON, sub.Secret, sub.Enabled, sub.ID,
+		sub.URL, string(filtersJSON), storedSecret, sub.Enabled, sub.ID,
 	)
 	if err != nil {
 		return Subscription{}, fmt.Errorf("updating subscription %d: %w", sub.ID, err)
@@ -1239,7 +1419,7 @@ func (s *SQLite) ListEnabledSubscriptions(ctx context.Context) ([]Subscription, 
 		return nil, fmt.Errorf("listing enabled subscriptions: %w", err)
 	}
 	defer rows.Close()
-	return scanSubscriptionsSQLite(rows)
+	return scanSubscriptionsSQLite(rows, s.FieldEncryptor())
 }
 
 func (s *SQLite) IncrementSubscriptionFailures(ctx context.Context, id int64, maxFailures int) (int, bool, error) {
@@ -1411,6 +1591,123 @@ func (s *SQLite) DeleteContractSpecOverride(ctx context.Context, contractID stri
 	return nil
 }
 
+// SetContractSpecOverrideWithHistory upserts the override and appends the
+// history row in one transaction, so the recorded history can never disagree
+// with the stored override.
+func (s *SQLite) SetContractSpecOverrideWithHistory(ctx context.Context, contractID string, specJSON []byte, apiKeyPrefix string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting contract spec override transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO contract_spec_overrides (contract_id, spec_json, updated_at)
+		VALUES (?, ?, datetime('now'))
+		ON CONFLICT (contract_id) DO UPDATE SET
+			spec_json  = excluded.spec_json,
+			updated_at = datetime('now')`,
+		contractID, string(specJSON),
+	); err != nil {
+		return fmt.Errorf("saving contract spec override for %s: %w", contractID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO contract_spec_override_history (contract_id, spec_json, api_key_prefix)
+		VALUES (?, ?, ?)`,
+		contractID, string(specJSON), apiKeyPrefix,
+	); err != nil {
+		return fmt.Errorf("recording contract spec override history for %s: %w", contractID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing contract spec override for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+// DeleteContractSpecOverrideWithHistory removes the override and appends a
+// tombstone history row in one transaction.
+func (s *SQLite) DeleteContractSpecOverrideWithHistory(ctx context.Context, contractID string, apiKeyPrefix string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting contract spec override transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM contract_spec_overrides WHERE contract_id = ?`, contractID,
+	); err != nil {
+		return fmt.Errorf("deleting contract spec override for %s: %w", contractID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO contract_spec_override_history (contract_id, spec_json, api_key_prefix)
+		VALUES (?, NULL, ?)`,
+		contractID, apiKeyPrefix,
+	); err != nil {
+		return fmt.Errorf("recording contract spec override history for %s: %w", contractID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing contract spec override delete for %s: %w", contractID, err)
+	}
+	return nil
+}
+
+// ListContractSpecOverrideHistory returns a contract's override history
+// newest first, with cursor pagination over the version id.
+func (s *SQLite) ListContractSpecOverrideHistory(ctx context.Context, contractID string, limit int, cursor string) ([]ContractSpecOverrideVersion, string, error) {
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+
+	var afterID int64
+	if cursor != "" {
+		id, err := DecodeSpecOverrideHistoryCursorForBackend(CursorBackendSQLite, cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		afterID = id
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, contract_id, spec_json, api_key_prefix, created_at
+		FROM contract_spec_override_history
+		WHERE contract_id = ? AND (? = 0 OR id < ?)
+		ORDER BY id DESC
+		LIMIT ?`,
+		contractID, afterID, afterID, limit,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing contract spec override history for %s: %w", contractID, err)
+	}
+	defer rows.Close()
+
+	var out []ContractSpecOverrideVersion
+	for rows.Next() {
+		var (
+			v       ContractSpecOverrideVersion
+			specSQL sql.NullString
+			ts      string
+		)
+		if err := rows.Scan(&v.ID, &v.ContractID, &specSQL, &v.APIKeyPrefix, &ts); err != nil {
+			return nil, "", fmt.Errorf("scanning contract spec override history for %s: %w", contractID, err)
+		}
+		// A tombstone row stores NULL, so the spec is absent rather than empty.
+		if specSQL.Valid && specSQL.String != "" {
+			v.Spec = []byte(specSQL.String)
+		}
+		v.CreatedAt = parseTime(ts)
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("listing contract spec override history for %s: %w", contractID, err)
+	}
+
+	next := ""
+	if len(out) == limit {
+		next = EncodeSpecOverrideHistoryCursorForBackend(CursorBackendSQLite, out[len(out)-1].ID)
+	}
+	return out, next, nil
+}
+
 func (s *SQLite) Stats(ctx context.Context, _ Scope) (Stats, error) {
 	var st Stats
 	err := s.db.QueryRowContext(ctx, `
@@ -1475,13 +1772,14 @@ func scanEventSQLite(row interface {
 
 func scanSubscription(row interface {
 	Scan(dest ...any) error
-}) (Subscription, error) {
+}, enc *FieldEncryptor) (Subscription, error) {
 	var (
-		s         Subscription
-		filters   []byte
-		createdAt string
+		s            Subscription
+		filters      string
+		storedSecret string
+		createdAt    string
 	)
-	err := row.Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled,
+	err := row.Scan(&s.ID, &s.URL, &filters, &storedSecret, &s.Enabled,
 		&s.FailureCount, &createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1489,27 +1787,42 @@ func scanSubscription(row interface {
 		}
 		return Subscription{}, fmt.Errorf("scanning subscription: %w", err)
 	}
-	if err := json.Unmarshal(filters, &s.Filters); err != nil {
-		return Subscription{}, fmt.Errorf("unmarshaling subscription filters: %w", err)
+	secret, err := decryptSubscriptionSecret(enc, storedSecret)
+	if err != nil {
+		return Subscription{}, fmt.Errorf("decrypting subscription %d secret: %w", s.ID, err)
+	}
+	s.Secret = secret
+	if filters != "" {
+		if err := json.Unmarshal([]byte(filters), &s.Filters); err != nil {
+			return Subscription{}, fmt.Errorf("unmarshaling subscription filters: %w", err)
+		}
 	}
 	s.CreatedAt = parseTime(createdAt)
 	return s, nil
 }
 
-func scanSubscriptionsSQLite(rows *sql.Rows) ([]Subscription, error) {
+func scanSubscriptionsSQLite(rows *sql.Rows, enc *FieldEncryptor) ([]Subscription, error) {
 	var subs []Subscription
 	for rows.Next() {
 		var (
-			s         Subscription
-			filters   []byte
-			createdAt string
+			s            Subscription
+			filters      string
+			storedSecret string
+			createdAt    string
 		)
-		if err := rows.Scan(&s.ID, &s.URL, &filters, &s.Secret, &s.Enabled,
+		if err := rows.Scan(&s.ID, &s.URL, &filters, &storedSecret, &s.Enabled,
 			&s.FailureCount, &createdAt); err != nil {
 			return nil, fmt.Errorf("scanning subscription: %w", err)
 		}
-		if err := json.Unmarshal(filters, &s.Filters); err != nil {
-			return nil, fmt.Errorf("unmarshaling subscription filters: %w", err)
+		secret, err := decryptSubscriptionSecret(enc, storedSecret)
+		if err != nil {
+			return nil, fmt.Errorf("decrypting subscription %d secret: %w", s.ID, err)
+		}
+		s.Secret = secret
+		if filters != "" {
+			if err := json.Unmarshal([]byte(filters), &s.Filters); err != nil {
+				return nil, fmt.Errorf("unmarshaling subscription filters: %w", err)
+			}
 		}
 		s.CreatedAt = parseTime(createdAt)
 		subs = append(subs, s)
@@ -1580,8 +1893,147 @@ func (s *SQLite) ListContractsNeedingRefresh(context.Context, time.Time) ([]stri
 	return nil, errUnsupported("sqlite", "ListContractsNeedingRefresh")
 }
 
-// ListContracts is not implemented for the SQLite backend: the contract
-// inventory endpoint is Postgres-only.
+// ListContracts returns one ContractSummary per indexed contract, using the
+// same aggregate shape and keyset pagination as the Postgres backend. The
+// cursor carries (sort value, contract_id); the sort value is normalized to
+// the column's stored representation before it is compared, because SQLite
+// compares TEXT byte by byte and the RFC3339Nano form contractSortValue
+// produces trims trailing zeros while the database stores a fixed-width
+// timestamp.
+func (s *SQLite) ListContracts(ctx context.Context, f ContractsFilter) ([]ContractSummary, string, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultQueryLimit
+	}
+	if limit > MaxQueryLimit {
+		limit = MaxQueryLimit
+	}
+	if !ValidContractsSortKey(f.SortKey) {
+		return nil, "", fmt.Errorf("unsupported sort_key %q", f.SortKey)
+	}
+
+	sortCol, sortExpr, sortType := contractsSortParts(f.SortKey)
+	orderDir := "DESC"
+	cursorOp := "<"
+	// contract_id is the documented default listing order and reads
+	// naturally ascending; activity-style keys keep their historical
+	// "busiest first" descending default.
+	if strings.EqualFold(f.Order, "asc") ||
+		(f.Order == "" && sortCol == "contract_id") {
+		orderDir = "ASC"
+		cursorOp = ">"
+	}
+	orderBy := fmt.Sprintf("%s %s, contract_id %s", sortExpr, orderDir, orderDir)
+	if sortCol == "contract_id" {
+		orderBy = fmt.Sprintf("contract_id %s", orderDir)
+	}
+
+	var (
+		where []string
+		have  []string
+		args  []any
+	)
+	arg := func(v any) string {
+		args = append(args, v)
+		return "?"
+	}
+	if f.ContractIDPrefix != "" {
+		where = append(where, "contract_id LIKE "+arg(f.ContractIDPrefix+"%"))
+	}
+	if f.Cursor != "" {
+		sortValue, contractID, err := DecodeContractsCursorForBackend(CursorBackendSQLite, f.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		// Bind the sort value in the type the column stores: integers stay
+		// integers so SQLite's type ordering cannot rank TEXT above them,
+		// and timestamps use the same fixed-width layout as formatTime.
+		normalized, err := contractsCursorValue(sortCol, sortType, sortValue)
+		if err != nil {
+			return nil, "", err
+		}
+		if sortCol == "contract_id" {
+			where = append(where, "contract_id "+cursorOp+" "+arg(normalized))
+		} else {
+			// Aggregate sort keys are only addressable after grouping, so
+			// the keyset predicate belongs in HAVING rather than WHERE.
+			have = append(have,
+				fmt.Sprintf("(%s, contract_id) %s (%s, %s)",
+					sortCol, cursorOp, arg(normalized), arg(contractID)))
+		}
+	}
+
+	query := `SELECT contract_id, count(*) AS event_count,
+	                 min(ledger) AS first_ledger, max(ledger) AS last_ledger,
+	                 max(created_at) AS last_seen
+	            FROM events`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " GROUP BY contract_id"
+	if len(have) > 0 {
+		query += " HAVING " + strings.Join(have, " AND ")
+	}
+	query += " ORDER BY " + orderBy + " LIMIT " + arg(limit+1)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("listing contracts: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]ContractSummary, 0, limit)
+	for rows.Next() {
+		var (
+			c        ContractSummary
+			lastSeen string
+		)
+		if err := rows.Scan(&c.ContractID, &c.EventCount,
+			&c.FirstLedger, &c.LastLedger, &lastSeen); err != nil {
+			return nil, "", fmt.Errorf("scanning contract summary: %w", err)
+		}
+		c.LastSeen = parseTime(lastSeen)
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("reading contracts: %w", err)
+	}
+
+	next := ""
+	if len(out) > limit {
+		last := out[limit-1]
+		out = out[:limit]
+		next = EncodeContractsCursorForBackend(CursorBackendSQLite, f.SortKey, contractSortValue(last, f.SortKey), last.ContractID)
+	}
+	return out, next, nil
+}
+
+// contractsCursorValue converts a decoded cursor's sort half back into the
+// value SQLite compares against. A malformed value is client input, so it is
+// reported as ErrInvalidContractsCursor rather than a query error.
+func contractsCursorValue(sortCol, sortType, value string) (any, error) {
+	// count(*) has no declared cast type in contractsSortParts (Postgres
+	// compares it as an untyped numeric literal), but SQLite orders TEXT
+	// after INTEGER across storage classes, so the count cursor must be
+	// bound as an integer or an activity-sorted page would skip rows.
+	if sortType == "bigint" || sortCol == "count(*)" {
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%w: contracts cursor", ErrInvalidContractsCursor)
+		}
+		return n, nil
+	}
+	switch sortType {
+	case "timestamptz":
+		t, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			return nil, fmt.Errorf("%w: contracts cursor", ErrInvalidContractsCursor)
+		}
+		return formatTime(t), nil
+	default:
+		return value, nil
+	}
+}
 
 // API keys are not implemented for the SQLite backend: single-node
 // deployments authenticate via the operator's own reverse proxy or run
@@ -1606,35 +2058,146 @@ func (s *SQLite) RevokeAPIKey(context.Context, int64) error {
 	return errUnsupported("sqlite", "RevokeAPIKey")
 }
 
-// GetContractSummary is not implemented for the SQLite backend: the contract
-// statistics endpoint is Postgres-only.
-func (s *SQLite) GetContractSummary(context.Context, string) (ContractSummary, error) {
-	return ContractSummary{}, errUnsupported("sqlite", "GetContractSummary")
+// GetContractSummary returns a single contract's summary row. Like the
+// Postgres implementation it aggregates the events table directly, so a
+// contract that only appears in the watch list but has emitted nothing is
+// reported as ErrNotFound.
+func (s *SQLite) GetContractSummary(ctx context.Context, contractID string) (ContractSummary, error) {
+	var (
+		c        ContractSummary
+		lastSeen string
+	)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT contract_id,
+		       count(*),
+		       min(ledger),
+		       max(ledger),
+		       max(created_at)
+		  FROM events
+		 WHERE contract_id = ?
+		 GROUP BY contract_id`, contractID,
+	).Scan(&c.ContractID, &c.EventCount, &c.FirstLedger, &c.LastLedger, &lastSeen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ContractSummary{}, ErrNotFound
+	}
+	if err != nil {
+		return ContractSummary{}, fmt.Errorf("get contract summary %s: %w", contractID, err)
+	}
+	c.LastSeen = parseTime(lastSeen)
+	return c, nil
 }
 
-// ContractEventTypeCounts is not implemented for the SQLite backend.
-func (s *SQLite) ContractEventTypeCounts(context.Context, string) ([]ContractEventTypeCount, error) {
-	return nil, errUnsupported("sqlite", "ContractEventTypeCounts")
+// ContractEventTypeCounts returns per-type event counts for a single
+// contract, ordered by count descending like the Postgres implementation.
+// The result is a non-nil empty slice when the contract has no events, so an
+// empty breakdown is distinguishable from a backend that cannot answer.
+func (s *SQLite) ContractEventTypeCounts(ctx context.Context, contractID string) ([]ContractEventTypeCount, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT type, count(*)
+		  FROM events
+		 WHERE contract_id = ?
+		 GROUP BY type
+		 ORDER BY count(*) DESC`, contractID)
+	if err != nil {
+		return nil, fmt.Errorf("contract event type counts %s: %w", contractID, err)
+	}
+	defer rows.Close()
+
+	out := make([]ContractEventTypeCount, 0)
+	for rows.Next() {
+		var c ContractEventTypeCount
+		if err := rows.Scan(&c.Type, &c.Count); err != nil {
+			return nil, fmt.Errorf("scanning contract event type count: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading contract event type counts: %w", err)
+	}
+	return out, nil
 }
 
-func (s *SQLite) ListContracts(context.Context, ContractsFilter) ([]ContractSummary, string, error) {
-	return nil, "", errUnsupported("sqlite", "ListContracts")
+// Per-contract cursors mirror the Postgres implementation. Watched-mode
+// ingestion uses them as its resume position, so a missing implementation
+// here would silently fall back to the global ingestion_state row and one
+// lagging contract would hold back every other watched contract — the
+// failure mode issue #534 describes. UpdatedAt and updated_at are stored
+// through the same padded-string convention as ingestion_state so
+// byte-wise ordering matches chronological ordering.
+func (s *SQLite) GetContractCursor(ctx context.Context, contractID string) (ContractCursor, error) {
+	var (
+		c  ContractCursor
+		ts string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT contract_id, last_ingested_ledger, last_cursor, updated_at
+		 FROM contract_cursors WHERE contract_id = ?`, contractID,
+	).Scan(&c.ContractID, &c.LastIngestedLedger, &c.LastCursor, &ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ContractCursor{}, ErrNotFound
+	}
+	if err != nil {
+		return ContractCursor{}, fmt.Errorf("loading cursor for contract %s: %w", contractID, err)
+	}
+	c.UpdatedAt = parseTime(ts)
+	return c, nil
 }
 
-// Per-contract cursors are not implemented for the SQLite backend: watched
-// ingestion there always uses the single global ingestion_state row. These
-// refuse explicitly instead of returning a zero cursor, so a caller that
-// expects per-contract resume positions learns the capability is absent
-// rather than silently resuming from ledger 0.
-func (s *SQLite) GetContractCursor(context.Context, string) (ContractCursor, error) {
-	return ContractCursor{}, errUnsupported("sqlite", "GetContractCursor")
+// SaveContractCursor upserts one contract's resume position.
+func (s *SQLite) SaveContractCursor(ctx context.Context, c ContractCursor) error {
+	now := formatTime(time.Now().UTC())
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO contract_cursors (contract_id, last_ingested_ledger, last_cursor, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (contract_id) DO UPDATE SET
+			last_ingested_ledger = excluded.last_ingested_ledger,
+			last_cursor          = excluded.last_cursor,
+			updated_at           = excluded.updated_at`,
+		c.ContractID, c.LastIngestedLedger, c.LastCursor, now,
+	)
+	if err != nil {
+		return fmt.Errorf("saving cursor for contract %s: %w", c.ContractID, err)
+	}
+	return nil
 }
-func (s *SQLite) SaveContractCursor(context.Context, ContractCursor) error {
-	return errUnsupported("sqlite", "SaveContractCursor")
+
+// DeleteContractCursor removes a contract's cursor row (used when a
+// contract leaves the watch list). It returns ErrNotFound when no row
+// matches so the removal of an unknown contract reads as an error rather
+// than a silent no-op.
+func (s *SQLite) DeleteContractCursor(ctx context.Context, contractID string) error {
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM contract_cursors WHERE contract_id = ?`, contractID)
+	if err != nil {
+		return fmt.Errorf("deleting cursor for contract %s: %w", contractID, err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
-func (s *SQLite) DeleteContractCursor(context.Context, string) error {
-	return errUnsupported("sqlite", "DeleteContractCursor")
-}
-func (s *SQLite) ListContractCursors(context.Context) ([]ContractCursor, error) {
-	return nil, errUnsupported("sqlite", "ListContractCursors")
+
+// ListContractCursors returns every tracked per-contract resume position.
+func (s *SQLite) ListContractCursors(ctx context.Context) ([]ContractCursor, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT contract_id, last_ingested_ledger, last_cursor, updated_at
+		 FROM contract_cursors ORDER BY contract_id`)
+	if err != nil {
+		return nil, fmt.Errorf("listing contract cursors: %w", err)
+	}
+	defer rows.Close()
+	var out []ContractCursor
+	for rows.Next() {
+		var (
+			c  ContractCursor
+			ts string
+		)
+		if err := rows.Scan(&c.ContractID, &c.LastIngestedLedger, &c.LastCursor, &ts); err != nil {
+			return nil, fmt.Errorf("scanning contract cursor: %w", err)
+		}
+		c.UpdatedAt = parseTime(ts)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }

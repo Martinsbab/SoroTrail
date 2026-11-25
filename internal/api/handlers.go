@@ -40,39 +40,92 @@ import (
 	"github.com/sorotrail/sorotrail/internal/store"
 )
 
-// maxJSONBodyBytes caps a JSON request body decoded by decodeJSONBody.
-// Every body it serves is a small control-plane object, so anything larger
-// is a client error, not something to buffer.
-const maxJSONBodyBytes = 4 << 10
+// errBodyTooLarge marks an oversized request body so handlers can report
+// 413 instead of 400. readJSONBody wraps it when the body exceeds the
+// configured limit, and decodeJSONBody reports it as 413.
+var errBodyTooLarge = errors.New("request body exceeds the configured limit")
 
-// decodeJSONBody parses a single small JSON body (≤4 KiB), rejecting
-// unknown fields so a typo like {"contractID": "..."} doesn't fall
-// through with an empty contract_id and a confusing 400 from a later
-// check. On success dst is overwritten with the decoded value; on any
-// error it is left untouched. Error text never quotes the body's values.
-func decodeJSONBody(r *http.Request, dst any) error {
-	rv := reflect.ValueOf(dst)
-	if rv.Kind() != reflect.Pointer || rv.IsNil() {
-		return fmt.Errorf("decodeJSONBody: dst must be a non-nil pointer, got %T", dst)
+// decodeJSONBody reads a single JSON request body into dst, enforcing the
+// server's configured request-body limit (s.httpRequestBodyLimit). On
+// success dst holds the decoded value and the method returns false. On
+// failure it writes 413 for an oversized body or 400 for malformed JSON,
+// unknown fields, trailing data, or an empty body — using the shared error
+// envelope — and returns true so the handler stops. dst is never left
+// half-populated: a failed decode publishes nothing, and error text never
+// quotes the body's values.
+//
+// Every handler that reads a JSON body goes through this method, so a
+// malformed request gets the same status and message no matter which route
+// serves it.
+func (s *Server) decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	body, err := readJSONBody(r, s.EffectiveRequestBodyLimit(r))
+	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			if !isDecompressedLimitError(err) {
+				s.recordPayloadRejection(r, "request_body")
+			}
+			writeError(w, http.StatusRequestEntityTooLarge, err)
+		} else {
+			writeError(w, http.StatusBadRequest, err)
+		}
+		return true
 	}
+	if err := decodeJSONBytes(body, dst); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return true
+	}
+	return false
+}
+
+// readJSONBody reads the request body once, bounded by limit. Handlers that
+// must inspect the body more than once (the spec-override PUT tries a wrapped
+// and a bare shape) read it here and decode from the returned bytes: r.Body
+// is a stream, so every reread would see an empty request.
+func readJSONBody(r *http.Request, limit int64) ([]byte, error) {
 	// Server requests always carry a non-nil Body, so an absent body shows
 	// up as zero bytes below; the nil check covers hand-built requests.
 	if r.Body == nil {
-		return errors.New("request body is empty")
+		return nil, errors.New("request body is empty")
 	}
 
-	// Read one byte past the cap so an oversized body is reported as too
-	// large instead of being truncated into a misleading "unexpected EOF".
-	// At most maxJSONBodyBytes+1 bytes are ever buffered.
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
-	if err != nil {
-		return fmt.Errorf("reading request body: %w", err)
+	var body []byte
+	var err error
+	if limit > 0 {
+		// Read one byte past the cap so an oversized body is reported as too
+		// large instead of being truncated into a misleading "unexpected EOF".
+		// At most limit+1 bytes are ever buffered. The body-limit middleware
+		// wraps r.Body in http.MaxBytesReader with the same limit, so its own
+		// "request body too large" error is normalized here too.
+		body, err = io.ReadAll(io.LimitReader(r.Body, limit+1))
+	} else {
+		body, err = io.ReadAll(r.Body)
 	}
-	if len(body) > maxJSONBodyBytes {
-		return fmt.Errorf("request body exceeds %d bytes", maxJSONBodyBytes)
+	if err != nil {
+		if isDecompressedLimitError(err) {
+			return nil, err
+		}
+		tooLarge := errors.Is(err, errBodyTooLarge) || strings.Contains(err.Error(), "request body too large")
+		if tooLarge {
+			return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
+		}
+		return nil, fmt.Errorf("reading request body: %w", err)
+	}
+	if limit > 0 && int64(len(body)) > limit {
+		return nil, fmt.Errorf("request body exceeds %d bytes: %w", limit, errBodyTooLarge)
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
-		return errors.New("request body is empty")
+		return nil, errors.New("request body is empty")
+	}
+	return body, nil
+}
+
+// decodeJSONBytes decodes one already-read body into dst with the same
+// guarantees decodeJSONBody has always given: unknown fields rejected,
+// exactly one JSON value, and a half-populated dst never published.
+func decodeJSONBytes(body []byte, dst any) error {
+	rv := reflect.ValueOf(dst)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return fmt.Errorf("decodeJSONBytes: dst must be a non-nil pointer, got %T", dst)
 	}
 
 	// Decode into a scratch value and publish it only on success:
@@ -97,6 +150,22 @@ func decodeJSONBody(r *http.Request, dst any) error {
 var cachePrivate atomic.Bool
 
 func SetCachePrivate(v bool) { cachePrivate.Store(v) }
+
+var maxSparseFilterLedgerSpan atomic.Int64
+
+// SetMaxSparseFilterLedgerSpan configures the maximum ledger span allowed
+// when querying sparse JSONB topic filters (topic, topic_contains, topic0..topic3)
+// on /events and /contracts/{id}/events. A value <= 0 disables the API-level cap.
+func SetMaxSparseFilterLedgerSpan(span int64) {
+	maxSparseFilterLedgerSpan.Store(span)
+	store.SetMaxSparseFilterLedgerSpan(span)
+}
+
+// MaxSparseFilterLedgerSpan returns the currently configured maximum ledger
+// span for sparse JSONB topic filters.
+func MaxSparseFilterLedgerSpan() int64 {
+	return maxSparseFilterLedgerSpan.Load()
+}
 
 // tenantScoped mirrors Server.multiTenant for the package-level cache
 // helpers, which are plain functions and have no server to ask.
@@ -146,7 +215,9 @@ const (
 )
 
 type errorResponse struct {
-	Error string `json:"error"`
+	Error string    `json:"error"`
+	Code  ErrorCode `json:"code"`
+	Field string    `json:"field,omitempty"`
 }
 
 type eventsResponse struct {
@@ -213,11 +284,6 @@ func wrapEnvelope(data any, cursor string) envelopeResponse {
 		data = reflect.MakeSlice(rv.Type(), 0, 0).Interface()
 	}
 	return envelopeResponse{Data: data, NextCursor: cursor}
-}
-
-type healthResponse struct {
-	Status string            `json:"status"`
-	Checks map[string]string `json:"checks"`
 }
 
 type versionResponse struct {
@@ -411,106 +477,6 @@ func eventToMap(ev store.Event, fields map[string]bool) map[string]any {
 
 }
 
-// handleHealth is the liveness probe. It reports whether the process
-// is alive and able to serve HTTP requests. It intentionally does NOT
-// check external dependencies (database, RPC) so a dependency outage
-// cannot trigger a restart loop — that is the readiness probe's job
-// (see handleReadyz).
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-
-	defer cancel()
-
-	resp := healthResponse{Status: "ok", Checks: map[string]string{"database": "ok"}}
-	status := http.StatusOK
-
-	// DB connectivity check: Ping the store to verify the database is reachable.
-
-	if err := s.store.Ping(ctx); err != nil {
-
-		resp.Status, resp.Checks["database"] = "degraded", err.Error()
-
-		status = http.StatusServiceUnavailable
-
-	}
-
-	if health, err := s.rpc.GetHealth(ctx); err != nil {
-
-		resp.Status, resp.Checks["rpc"] = "degraded", err.Error()
-
-		status = http.StatusServiceUnavailable
-
-	} else if health.Status != "healthy" {
-
-		resp.Status, resp.Checks["rpc"] = "degraded", fmt.Sprintf("rpc reports %q", health.Status)
-
-		status = http.StatusServiceUnavailable
-
-	}
-
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-
-	writeJSON(w, status, resp)
-
-}
-
-// handleMetrics serves the Prometheus /metrics endpoint. The response is
-// always cacheNoStore so scrapers never see a stale snapshot.
-func (s *Server) handleLivez(w http.ResponseWriter, r *http.Request) {
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Checks: map[string]string{"process": "ok"}})
-}
-
-func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	resp := healthResponse{Status: "ok", Checks: map[string]string{
-		"database":      "ok",
-		"rpc":           "ok",
-		"ingestion_lag": "ok",
-	}}
-	status := http.StatusOK
-
-	if err := s.store.Ping(ctx); err != nil {
-		resp.Status = "degraded"
-		resp.Checks["database"] = err.Error()
-		status = http.StatusServiceUnavailable
-	}
-	if health, err := s.rpc.GetHealth(ctx); err != nil {
-		resp.Status = "degraded"
-		resp.Checks["rpc"] = err.Error()
-		status = http.StatusServiceUnavailable
-	} else if health.Status != "healthy" {
-		resp.Status = "degraded"
-		resp.Checks["rpc"] = fmt.Sprintf("rpc reports %q", health.Status)
-		status = http.StatusServiceUnavailable
-	}
-
-	// Check ingestion lag: if we're more than 100 ledgers behind the chain
-	// head, mark the instance as not ready (it should be pulled from the
-	// load balancer until it catches up).
-	if state, err := s.store.GetIngestionState(ctx); err == nil {
-		// Only check lag if we have an ingestion state and an RPC client.
-		if s.rpc != nil {
-			if health, err := s.rpc.GetHealth(ctx); err == nil {
-				lag := ingestLagLedgers(int64(health.LatestLedger), state.LastIngestedLedger)
-				if lag > 100 && state.LastIngestedLedger > 0 {
-					resp.Status = "degraded"
-					resp.Checks["ingestion_lag"] = fmt.Sprintf(
-						"%d ledgers behind (last ingested: %d, chain head: %d)",
-						lag, state.LastIngestedLedger, health.LatestLedger)
-					status = http.StatusServiceUnavailable
-				}
-			}
-		}
-	}
-
-	writeCacheHeaders(w, cacheNoStore, 0, "")
-	writeJSON(w, status, resp)
-}
-
 // handleDeleteEvents is the admin-only bulk delete endpoint. It deletes all
 // events whose ledger is strictly less than the ?before_ledger= query parameter.
 // The endpoint is protected by apiKeyAuth middleware (same as watched-contracts).
@@ -598,6 +564,9 @@ func (s *Server) handleCountEvents(w http.ResponseWriter, r *http.Request) {
 
 	total, err := s.store.CountEvents(r.Context(), filter)
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		loggerFromContext(r.Context()).Error("counting events", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("counting events failed"))
 		return
@@ -655,6 +624,9 @@ func (s *Server) handleAggregateEvents(w http.ResponseWriter, r *http.Request) {
 
 	buckets, err := s.store.AggregateEvents(r.Context(), filter, bucket)
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		loggerFromContext(r.Context()).Error("aggregating events", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("aggregating events failed"))
 		return
@@ -751,7 +723,15 @@ func (s *Server) handleListEventsStream(w http.ResponseWriter, r *http.Request) 
 
 	events, cursor, qerr := s.store.QueryEvents(ctx, filter)
 
+	if errors.Is(qerr, store.ErrSparseFilterRangeTooWide) || errors.Is(qerr, store.ErrInvalidCursor) {
+		writeFilterError(w, qerr)
+		return
+	}
+
 	if qerr != nil {
+		if writePoolBudgetExhausted(w, qerr) {
+			return
+		}
 
 		loggerFromContext(ctx).Error("streaming events (first batch)", "error", qerr)
 
@@ -987,7 +967,15 @@ func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request, filter stor
 
 	}
 
+	if errors.Is(qerr, store.ErrSparseFilterRangeTooWide) {
+		writeFilterError(w, qerr)
+		return
+	}
+
 	if qerr != nil {
+		if writePoolBudgetExhausted(w, qerr) {
+			return
+		}
 
 		loggerFromContext(r.Context()).Error("querying events", "error", qerr)
 
@@ -1368,6 +1356,9 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 
 		loggerFromContext(r.Context()).Error("loading event", "id", id, "error", err)
 
@@ -1522,6 +1513,7 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 		SortKey:          r.URL.Query().Get("sort"),
 		Order:            r.URL.Query().Get("order"),
 		Cursor:           r.URL.Query().Get("cursor"),
+		Scope:            scopeFrom(r.Context()),
 	}
 	if !store.ValidContractsSortKey(f.SortKey) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf(
@@ -1552,6 +1544,10 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 	}
 	items, cursor, err := s.store.ListContracts(r.Context(), f)
 	if err != nil {
+		if errors.Is(err, store.ErrUnsupported) {
+			writeError(w, http.StatusNotImplemented, err)
+			return
+		}
 		// A cursor that passes the charset check but not the decode is
 		// bad client input (400), not a server fault (500).
 		if errors.Is(err, store.ErrInvalidContractsCursor) {
@@ -1559,6 +1555,9 @@ func (s *Server) handleListContracts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		loggerFromContext(r.Context()).Error("listing contracts", "error", err)
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		writeError(w, http.StatusInternalServerError, errors.New("listing contracts failed"))
 		return
 	}
@@ -1673,6 +1672,7 @@ func (s *Server) handleDeleteDeadLetter(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, errors.New("deleting dead letter failed"))
 		return
 	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1692,6 +1692,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.assembleStats(r.Context())
 	if err != nil {
+		if writePoolBudgetExhausted(w, err) {
+			return
+		}
 		loggerFromContext(r.Context()).Error("loading stats", "error", err)
 		writeError(w, http.StatusInternalServerError, errors.New("loading stats failed"))
 		return
@@ -1705,7 +1708,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		stats.SpecCache = sc.SpecCacheStats()
 	}
 
-	s.getStatsCache().Put(key, stats, time.Now())
+	var tenantID int64
+	if p, ok := PrincipalFrom(r.Context()); ok && !p.Untenanted {
+		tenantID = p.Tenant.ID
+	}
+	s.getStatsCache().PutForTenant(tenantID, key, stats, time.Now())
 	writeCacheHeaders(w, cacheNoStore, 0, "")
 	writeJSON(w, http.StatusOK, stats)
 }
@@ -1815,10 +1822,15 @@ func (s *Server) assembleStats(ctx context.Context) (store.Stats, error) {
 
 type addWatchedRequest struct {
 	ContractID string `json:"contract_id"`
+	// Network names the Stellar network this entry is watched on.
+	// Empty means the deployment's default network, which keeps the
+	// pre-multi-network request body valid.
+	Network string `json:"network,omitempty"`
 }
 
 type addWatchedResponse struct {
 	ContractID string `json:"contract_id"`
+	Network    string `json:"network"`
 
 	AddedAt string `json:"added_at"`
 
@@ -1828,6 +1840,7 @@ type addWatchedResponse struct {
 
 type removeWatchedResponse struct {
 	ContractID string `json:"contract_id"`
+	Network    string `json:"network"`
 
 	RemovedAt string `json:"removed_at"`
 
@@ -1871,12 +1884,8 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	var req addWatchedRequest
 
-	if err := decodeJSONBody(r, &req); err != nil {
-
-		writeError(w, http.StatusBadRequest, err)
-
+	if s.decodeJSONBody(w, r, &req) {
 		return
-
 	}
 
 	if !config.ValidContractID(req.ContractID) {
@@ -1903,14 +1912,30 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	modeTransition := ""
 
-	if len(current) == 0 {
+	// The mode transition is per target network: ingestion on a network
+	// switches from "all contract events" to a specific list when that
+	// network gains its first entry. Entries on other networks keep
+	// their own deployments' modes and are irrelevant here.
+	targetNetwork := s.effectiveNetwork(req.Network)
+	targetLabel := defaultNetworkLabel(targetNetwork)
+	instanceLabel := defaultNetworkLabel(s.defaultNetwork)
+	onTargetNetwork := 0
+	alreadyWatchedOnTarget := false
+	for _, wc := range current {
+		wcNetwork := defaultNetworkLabel(wc.Network)
+		if wcNetwork == targetLabel {
+			onTargetNetwork++
+			if wc.ContractID == req.ContractID {
+				alreadyWatchedOnTarget = true
+			}
+		}
+	}
+	if onTargetNetwork == 0 {
 
 		if r.URL.Query().Get("confirm") != "true" {
 
 			writeError(w, http.StatusBadRequest, errors.New(
-
 				"adding the first watched contract would switch ingestion from "+
-
 					"'all contract events' to a specific list — pass ?confirm=true to acknowledge"))
 
 			return
@@ -1921,10 +1946,10 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	state, err := s.store.GetIngestionState(r.Context())
+	state, err := s.getIngestionStateForNetwork(r.Context(), targetNetwork)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 
-		loggerFromContext(r.Context()).Error("loading ingestion state for add", "error", err)
+		loggerFromContext(r.Context()).Error("loading ingestion state for add", "network", targetLabel, "error", err)
 
 		writeError(w, http.StatusInternalServerError, errors.New("loading ingestion state failed"))
 
@@ -1932,7 +1957,8 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	if err := s.store.AddWatchedContract(r.Context(), req.ContractID); err != nil {
+	wanted := store.WatchedContract{ContractID: req.ContractID, Network: targetNetwork}
+	if err := s.store.AddWatchedContract(r.Context(), wanted); err != nil {
 
 		loggerFromContext(r.Context()).Error("adding watched contract", "contract_id", req.ContractID, "error", err)
 
@@ -1947,19 +1973,25 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	// a contract resumes, never re-backfills); otherwise the cold-start
 	// retention window - latest minus RETENTION_LEDGERS, clamped to what
 	// the RPC still retains - is where the automatic backfill starts.
+	//
+	// contract_cursors and s.rpc are bound to this instance's configured
+	// network, so they only apply when targetNetwork matches the instance
+	// network (or when the contract was already watched on targetNetwork).
 	historyFrom := state.LastIngestedLedger
-	if cc, cerr := s.store.GetContractCursor(r.Context(), req.ContractID); cerr == nil {
-		historyFrom = cc.LastIngestedLedger
-	} else if errors.Is(cerr, store.ErrNotFound) {
-		if health, herr := s.rpc.GetHealth(r.Context()); herr == nil {
-			start := int64(health.LatestLedger) - int64(s.retentionWindow())
-			if oldest := int64(health.OldestLedger); start < oldest {
-				start = oldest
+	if targetLabel == instanceLabel || alreadyWatchedOnTarget {
+		if cc, cerr := s.store.GetContractCursor(r.Context(), req.ContractID); cerr == nil {
+			historyFrom = cc.LastIngestedLedger
+		} else if errors.Is(cerr, store.ErrNotFound) && targetLabel == instanceLabel {
+			if health, herr := s.rpc.GetHealth(r.Context()); herr == nil {
+				start := int64(health.LatestLedger) - int64(s.retentionWindow())
+				if oldest := int64(health.OldestLedger); start < oldest {
+					start = oldest
+				}
+				if start < 2 {
+					start = 2
+				}
+				historyFrom = start
 			}
-			if start < 2 {
-				start = 2
-			}
-			historyFrom = start
 		}
 	}
 
@@ -1970,6 +2002,7 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, addWatchedResponse{
 
 		ContractID: req.ContractID,
+		Network:    targetLabel,
 
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 
@@ -1980,19 +2013,31 @@ func (s *Server) handleAddWatchedChain(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
+func (s *Server) getIngestionStateForNetwork(ctx context.Context, network string) (store.IngestionState, error) {
+	if r, ok := s.store.(interface {
+		GetIngestionStateForNetwork(context.Context, string) (store.IngestionState, error)
+	}); ok {
+		return r.GetIngestionStateForNetwork(ctx, network)
+	}
+	if defaultNetworkLabel(network) == defaultNetworkLabel(s.defaultNetwork) {
+		return s.store.GetIngestionState(ctx)
+	}
+	return store.IngestionState{}, store.ErrNotFound
+}
 
+func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	if !config.ValidContractID(id) {
-
 		writeError(w, http.StatusBadRequest,
-
 			fmt.Errorf("invalid contract id %q (want 56-char C... strkey)", id))
-
 		return
-
 	}
+	// Removal addresses one (network, contract) row. An explicit
+	// ?network= wins; otherwise the entry is removed from the
+	// deployment's own network, which is where the add endpoint would
+	// have filed it.
+	network := s.effectiveNetwork(r.URL.Query().Get("network"))
 
 	current, err := s.store.ListWatchedContracts(r.Context())
 
@@ -2008,7 +2053,26 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	modeTransition := ""
 
-	if len(current) == 1 && current[0].ContractID == id {
+	// The mode-transition check is per deployment: ingestion falls back
+	// to "all contract events" only when this removal empties the watch
+	// list on the target network — the network the ingester polls. An
+	// entry still watched on another network does not keep this
+	// deployment's specific-list mode alive, and vice versa.
+	onTargetNetwork := 0
+	removingIsOnlyEntry := false
+	for _, wc := range current {
+		wcNetwork := wc.Network
+		if wcNetwork == "" {
+			wcNetwork = "default"
+		}
+		if wcNetwork == defaultNetworkLabel(network) {
+			onTargetNetwork++
+			if wc.ContractID == id {
+				removingIsOnlyEntry = true
+			}
+		}
+	}
+	if onTargetNetwork == 1 && removingIsOnlyEntry {
 
 		if r.URL.Query().Get("confirm") != "true" {
 
@@ -2026,7 +2090,7 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 
 	}
 
-	if err := s.store.RemoveWatchedContract(r.Context(), id); err != nil {
+	if err := s.store.RemoveWatchedContract(r.Context(), store.WatchedContract{ContractID: id, Network: network}); err != nil {
 
 		if errors.Is(err, store.ErrNotFound) {
 
@@ -2051,6 +2115,7 @@ func (s *Server) handleRemoveWatchedChain(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, removeWatchedResponse{
 
 		ContractID: id,
+		Network:    defaultNetworkLabel(network),
 
 		RemovedAt: time.Now().UTC().Format(time.RFC3339),
 
@@ -2792,6 +2857,12 @@ func filterFromQuery(r *http.Request) (store.EventFilter, error) {
 		f.Limit = n
 	}
 
+	if span := maxSparseFilterLedgerSpan.Load(); span > 0 {
+		if err := store.ValidateSparseFilterRange(f, span); err != nil {
+			return f, err
+		}
+	}
+
 	return f, nil
 
 }
@@ -2824,44 +2895,74 @@ func (s *Server) syncStreamScope(ctx context.Context, sub *broadcast.Subscriptio
 	if every <= 0 {
 		every = DefaultStreamScopeSync
 	}
+	watchCh, unregister := s.registerStreamWatcher(p.Tenant.ID, p.KeyID)
 	go func() {
+		defer unregister()
 		ticker := time.NewTicker(every)
 		defer ticker.Stop()
+		refresh := func() bool {
+			if p.KeyID > 0 {
+				keys, err := s.tenants.ListTenantAPIKeys(ctx, p.Tenant.ID)
+				if err != nil {
+					loggerFromContext(ctx).Warn("refreshing stream api key", "tenant", p.Tenant.ID, "error", err)
+					return true
+				}
+				keyActive := false
+				for _, k := range keys {
+					if k.ID == p.KeyID && k.RevokedAt == nil {
+						keyActive = true
+						break
+					}
+				}
+				if !keyActive {
+					sub.SetScope(store.Scope{})
+					return false
+				}
+			}
+			// Re-read the tenant too, so a suspension (enabled=false)
+			// or a switch away from wildcard takes effect on open
+			// streams and not just on new requests.
+			tenant, err := s.tenants.GetTenant(ctx, p.Tenant.ID)
+			if errors.Is(err, store.ErrNotFound) {
+				// Deleted mid-stream: revoke everything. The read loop
+				// sees an empty scope and the connection goes quiet
+				// rather than continuing to serve a tenant that no
+				// longer exists.
+				sub.SetScope(store.Scope{})
+				return false
+			}
+			if err != nil {
+				// Leave the existing scope in place on a transient
+				// database error: it was correct as of the last
+				// successful resolve, and widening or narrowing on a
+				// failed read would be guessing.
+				loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+				return true
+			}
+			if !tenant.Enabled {
+				sub.SetScope(store.Scope{})
+				return false
+			}
+			scope, err := s.tenantScope(ctx, tenant)
+			if err != nil {
+				loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
+				return true
+			}
+			sub.SetScope(scope)
+			return true
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-watchCh:
+				if !refresh() {
+					return
+				}
 			case <-ticker.C:
-				// Re-read the tenant too, so a suspension (enabled=false)
-				// or a switch away from wildcard takes effect on open
-				// streams and not just on new requests.
-				tenant, err := s.tenants.GetTenant(ctx, p.Tenant.ID)
-				if errors.Is(err, store.ErrNotFound) {
-					// Deleted mid-stream: revoke everything. The read loop
-					// sees an empty scope and the connection goes quiet
-					// rather than continuing to serve a tenant that no
-					// longer exists.
-					sub.SetScope(store.Scope{})
+				if !refresh() {
 					return
 				}
-				if err != nil {
-					// Leave the existing scope in place on a transient
-					// database error: it was correct as of the last
-					// successful resolve, and widening or narrowing on a
-					// failed read would be guessing.
-					loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
-					continue
-				}
-				if !tenant.Enabled {
-					sub.SetScope(store.Scope{})
-					return
-				}
-				scope, err := s.tenants.ScopeForTenant(ctx, tenant)
-				if err != nil {
-					loggerFromContext(ctx).Warn("refreshing stream scope", "tenant", p.Tenant.ID, "error", err)
-					continue
-				}
-				sub.SetScope(scope)
 			}
 		}
 	}()
@@ -3053,9 +3154,54 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = enc.Encode(v)
 }
 
-func writeError(w http.ResponseWriter, status int, err error) {
+// writePoolBudgetExhausted writes a retriable 503 Service Unavailable with a
+// Retry-After header when err wraps store.ErrPoolBudgetExhausted (#1231) or
+// store.ErrStoreUnavailable (#1282).
+func writePoolBudgetExhausted(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, store.ErrStoreUnavailable) {
+		retrySecs := 2
+		var unavailErr *store.StoreUnavailableError
+		if errors.As(err, &unavailErr) && unavailErr.RetryAfter > 0 {
+			if s := int(unavailErr.RetryAfter.Seconds()); s > 0 {
+				retrySecs = s
+			}
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+		writeCacheHeaders(w, cacheNoStore, 0, "")
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+			Error: "database is temporarily unavailable; retry after recovery backoff",
+			Code:  CodeServiceUnavailable,
+		})
+		return true
+	}
+	if !errors.Is(err, store.ErrPoolBudgetExhausted) {
+		return false
+	}
+	retrySecs := 1
+	var budgetErr *store.PoolBudgetExhaustedError
+	if errors.As(err, &budgetErr) && budgetErr.RetryAfter > 0 {
+		if s := int(budgetErr.RetryAfter.Seconds()); s > 0 {
+			retrySecs = s
+		}
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
 	writeCacheHeaders(w, cacheNoStore, 0, "")
+	writeJSON(w, http.StatusServiceUnavailable, errorResponse{
+		Error: "database connection pool budget exhausted; retry after backpressure clears",
+		Code:  CodeServiceUnavailable,
+	})
+	return true
+}
 
-	writeJSON(w, status, errorResponse{Error: err.Error()})
-
+func writeError(w http.ResponseWriter, status int, err error) {
+	if writePoolBudgetExhausted(w, err) {
+		return
+	}
+	writeCacheHeaders(w, cacheNoStore, 0, "")
+	code, field, msg := classifyError(status, err)
+	writeJSON(w, status, errorResponse{
+		Error: msg,
+		Code:  code,
+		Field: field,
+	})
 }

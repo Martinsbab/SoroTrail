@@ -87,7 +87,8 @@ var handlerLocalParameters = map[string]parameterProvenance{
 		note: "a destructive write refuses to run unless this is exactly true"},
 	"fields": {parser: "parseFields",
 		note: "an allowlist projection of response keys; unknown names are a 400"},
-	"format": {parser: "parseExportFormat", note: "csv|ndjson, rejected otherwise, on the two export endpoints"},
+	"format":     {parser: "parseExportFormat", note: "csv|ndjson, rejected otherwise, on the two export endpoints"},
+	"terminator": {parser: "parseExportTerminator", note: "true|false: append an in-band end marker to an export"},
 	"bucket": {parser: "time.ParseDuration",
 		note: "aggregate bucket: 'ledger' or a Go duration, checked in the handler"},
 	"decoded": {parser: "decodeModeFromQuery",
@@ -104,6 +105,8 @@ var handlerLocalParameters = map[string]parameterProvenance{
 		note: "passed to the store as a literal prefix; the shared builder only checks it does not collide with contract_id"},
 	"tx_hash": {parser: "none",
 		note: "passed through to the store unvalidated, unlike contract_id"},
+	"network": {parser: "none",
+		note: "watched-contract removal scope: an absent value means the default network, and an unknown name returns 404 from the store rather than a validator error"},
 }
 
 // queryParametersRead walks the package's non-test sources and returns every

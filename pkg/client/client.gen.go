@@ -16,7 +16,7 @@ import (
 // SpecVersion is the api/openapi.yaml info.version this client was
 // generated from. A client built against a different spec version may
 // not be wire-compatible with a running server.
-const SpecVersion = "0.1.0"
+const SpecVersion = "0.2.0"
 
 // SpecRoute is one (method, path) pair documented in the spec.
 type SpecRoute struct {
@@ -52,6 +52,8 @@ var SpecRoutes = []SpecRoute{
 	{Method: "DELETE", Path: "/contracts/{id}/spec"},
 	{Method: "GET", Path: "/contracts/{id}/spec"},
 	{Method: "PUT", Path: "/contracts/{id}/spec"},
+	{Method: "GET", Path: "/contracts/{id}/spec/history"},
+	{Method: "POST", Path: "/contracts/{id}/spec/revert"},
 	{Method: "GET", Path: "/contracts/{id}/stats"},
 	{Method: "GET", Path: "/dead-letters"},
 	{Method: "DELETE", Path: "/dead-letters/{id}"},
@@ -139,6 +141,26 @@ type ContractListResponse = ContractsPage
 type ContractSpecOverrideRequest struct {
 	// Spec SEP-0041 contract specification JSON.
 	Spec map[string]any `json:"spec"`
+}
+
+// ContractSpecOverrideRevertRequest Names the override-history entry to restore. The id is the one listed by GET /contracts/{id}/spec/history.
+type ContractSpecOverrideRevertRequest struct {
+	// Version The id of the history entry to restore.
+	Version int64 `json:"version"`
+}
+
+// ContractSpecOverrideVersion One recorded change to a contract's spec override. The spec is absent for a tombstone entry, which means the override was deleted at that point rather than replaced.
+type ContractSpecOverrideVersion struct {
+	// ApiKeyPrefix The public prefix of the API key that made the change. The secret half of the key is never stored.
+	ApiKeyPrefix string `json:"api_key_prefix"`
+	// ContractID The contract whose override changed.
+	ContractID string `json:"contract_id"`
+	// CreatedAt When the change was recorded.
+	CreatedAt string `json:"created_at"`
+	// ID The version number. It is also the pagination cursor.
+	ID int64 `json:"id"`
+	// Spec The override document that was in force. Absent for a tombstone entry.
+	Spec map[string]any `json:"spec,omitempty"`
 }
 
 // ContractSummary API schema used by the SoroTrail client.
@@ -230,13 +252,27 @@ type DeliveryEnvelopeResponse struct {
 	NextCursor string            `json:"next_cursor,omitempty"`
 }
 
+// DependencyCheck One dependency's state inside a health envelope: what state it is in, why it isn't ok, and how long its own probe took.
+type DependencyCheck struct {
+	// Detail Human-readable cause, present only when status is not ok.
+	Detail string `json:"detail,omitempty"`
+	// LatencyMs Wall time of this check alone, in milliseconds.
+	LatencyMs int64 `json:"latency_ms"`
+	// Status `ok` — answered within its budget and healthy. `degraded` — answered, but reports a suboptimal state (a non-healthy RPC, or ingestion past the lag threshold). `unready` — did not answer at all: it errored or exceeded its per-check timeout.
+	Status string `json:"status"`
+}
+
 // EnrichedEvent API schema used by the SoroTrail client.
 type EnrichedEvent map[string]any
 
 // ErrorResponse Standard error envelope
 type ErrorResponse struct {
+	// Code Stable machine-readable error code
+	Code string `json:"code"`
 	// Error Human-readable error message
 	Error string `json:"error"`
+	// Field Request parameter or JSON field that caused a validation error
+	Field string `json:"field,omitempty"`
 }
 
 // Event A Stellar/Soroban contract event
@@ -305,8 +341,9 @@ type GrantList struct {
 	ContractIds []string `json:"contract_ids"`
 }
 
-// HealthResponse API schema used by the SoroTrail client.
+// HealthResponse Envelope shared by /health, /livez and /readyz. status aggregates the checks: unready dominates degraded, which dominates ok.
 type HealthResponse struct {
+	// Checks One entry per dependency the endpoint consulted; empty of dependency entries on /livez, which reports only `process`.
 	Checks map[string]any `json:"checks"`
 	Status string         `json:"status"`
 }
@@ -390,7 +427,9 @@ type Tenant struct {
 	Name                string          `json:"name"`
 	RateLimitBurst      json.RawMessage `json:"rate_limit_burst,omitempty"`
 	RateLimitRps        json.RawMessage `json:"rate_limit_rps,omitempty"`
-	Wildcard            bool            `json:"wildcard"`
+	// RetentionMaxAgeSeconds The tenant's own event-retention horizon in seconds. Absent or null means it inherits the instance default.
+	RetentionMaxAgeSeconds json.RawMessage `json:"retention_max_age_seconds,omitempty"`
+	Wildcard               bool            `json:"wildcard"`
 }
 
 // TenantAPIKey Tenant API key metadata; secret is returned only on creation.
@@ -431,6 +470,8 @@ type TenantCreateRequest struct {
 	RateLimitBurst int64 `json:"rate_limit_burst,omitempty"`
 	// RateLimitRps Optional requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
 	RateLimitRps float64 `json:"rate_limit_rps,omitempty"`
+	// RetentionMaxAgeSeconds The tenant's event-retention horizon in seconds. Omit or send 0 to inherit the instance default (RETENTION_MAX_AGE). A shared contract's events are kept for the longest horizon among the tenants entitled to it, and each tenant reads only within its own horizon. See docs/multi-tenancy.md#retention.
+	RetentionMaxAgeSeconds int64 `json:"retention_max_age_seconds,omitempty"`
 	// Wildcard When true, the tenant can read events for every contract.
 	Wildcard bool `json:"wildcard,omitempty"`
 }
@@ -444,6 +485,8 @@ type TenantList struct {
 type TenantUpdateRequest struct {
 	// Admin When true, the tenant may use the administrative API.
 	Admin bool `json:"admin,omitempty"`
+	// ConfirmRetentionShortening Must be true when the update shortens the tenant's effective retention horizon. Shortening is irreversible once the next prune sweep runs, so without it the request is refused with 409.
+	ConfirmRetentionShortening bool `json:"confirm_retention_shortening,omitempty"`
 	// Enabled Whether the tenant is enabled for requests.
 	Enabled bool `json:"enabled,omitempty"`
 	// MaxWatchedContracts Maximum number of contracts this tenant may watch.
@@ -454,6 +497,8 @@ type TenantUpdateRequest struct {
 	RateLimitBurst int64 `json:"rate_limit_burst,omitempty"`
 	// RateLimitRps Requests-per-second override. Set together with rate_limit_burst; omit both to inherit the instance limit.
 	RateLimitRps float64 `json:"rate_limit_rps,omitempty"`
+	// RetentionMaxAgeSeconds Replacement event-retention horizon in seconds; 0 clears the override so the tenant inherits the instance default again.
+	RetentionMaxAgeSeconds int64 `json:"retention_max_age_seconds,omitempty"`
 	// Wildcard When true, the tenant can read events for every contract.
 	Wildcard bool `json:"wildcard,omitempty"`
 }
@@ -482,7 +527,19 @@ type UpdateSubscriptionRequest struct {
 
 // UsagePage API schema used by the SoroTrail client.
 type UsagePage struct {
-	Usage []TenantUsage `json:"usage"`
+	// InstanceWatchListFull Tenant view only, and only when the instance has a watch-list cap. True when the instance-wide watch list is full, so adding a contract that no tenant already watches would be refused. The instance total is deliberately not given: it is aggregate usage across every tenant.
+	InstanceWatchListFull bool `json:"instance_watch_list_full,omitempty"`
+	// InstanceWatchedContracts Admin view only (`GET /admin/tenants/{id}/usage`): distinct contracts watched across the whole instance against `MULTI_TENANT_MAX_WATCHED`.
+	InstanceWatchedContracts any           `json:"instance_watched_contracts,omitempty"`
+	Usage                    []TenantUsage `json:"usage"`
+	// WatchedContracts The tenant's own watch list: contracts held against its `max_watched_contracts`. `POST /tenant/watch` returns 429 once `held` reaches `limit`; a null `limit` means the tenant has no cap of its own (the instance-wide cap still applies).
+	WatchedContracts any `json:"watched_contracts"`
+}
+
+// WatchHeadroom How much of a watch-list cap is in use. `limit` is null when there is no cap.
+type WatchHeadroom struct {
+	Held  int64  `json:"held"`
+	Limit *int64 `json:"limit"`
 }
 
 // WatchedContract One contract in the global ingestion watch list.
@@ -490,6 +547,8 @@ type WatchedContract struct {
 	// AddedAt When the contract was added to the watch list.
 	AddedAt    string `json:"added_at"`
 	ContractID string `json:"contract_id"`
+	// Network The network this entry is watched on. Always present in responses; entries written without a network are reported as "default".
+	Network string `json:"network,omitempty"`
 }
 
 // WatchedContractAdded Result of adding a contract to the global watch list.
@@ -498,6 +557,8 @@ type WatchedContractAdded struct {
 	ContractID        string `json:"contract_id"`
 	HistoryFromLedger int64  `json:"history_from_ledger"`
 	ModeTransition    string `json:"mode_transition,omitempty"`
+	// Network The network the entry was filed on (echoes the request's network or the deployment default).
+	Network string `json:"network"`
 }
 
 // WatchedContractRemoved Result of removing a contract from the global watch list.
@@ -505,13 +566,17 @@ type WatchedContractRemoved struct {
 	ContractID       string `json:"contract_id"`
 	HistoryPreserved bool   `json:"history_preserved"`
 	ModeTransition   string `json:"mode_transition,omitempty"`
-	RemovedAt        string `json:"removed_at"`
+	// Network The network the entry was removed from.
+	Network   string `json:"network"`
+	RemovedAt string `json:"removed_at"`
 }
 
 // WatchedContractRequest JSON body used to add a contract to a watch list.
 type WatchedContractRequest struct {
 	// ContractID Stellar contract ID to add to the watch list.
 	ContractID string `json:"contract_id"`
+	// Network The Stellar network this entry is watched on. Omit to file the contract on the deployment's configured NETWORK (falling back to "default" when that is unset). The same contract watched on two networks is two independent watch-list entries.
+	Network string `json:"network,omitempty"`
 }
 
 // WatchedContractsPage The complete global contract watch list.
@@ -580,6 +645,13 @@ type GetContractSpecOverrideResponse struct {
 	Spec       map[string]any `json:"spec"`
 }
 
+// ListContractSpecOverrideHistoryResponse API schema used by the SoroTrail client.
+type ListContractSpecOverrideHistoryResponse struct {
+	Count    int64                         `json:"count"`
+	Cursor   string                        `json:"cursor,omitempty"`
+	Versions []ContractSpecOverrideVersion `json:"versions"`
+}
+
 // ListDeadLettersResponse API schema used by the SoroTrail client.
 type ListDeadLettersResponse = DeadLettersPage
 
@@ -596,6 +668,12 @@ type PutContractSpecOverrideResponse struct {
 type RawEventResponse struct {
 	TopicsXdr []string `json:"topics_xdr,omitempty"`
 	ValueXdr  string   `json:"value_xdr,omitempty"`
+}
+
+// RevertContractSpecOverrideResponse API schema used by the SoroTrail client.
+type RevertContractSpecOverrideResponse struct {
+	ContractID string         `json:"contract_id"`
+	Spec       map[string]any `json:"spec"`
 }
 
 // VersionResponse API schema used by the SoroTrail client.
@@ -1004,6 +1082,7 @@ func (c *Client) ContractExport(ctx context.Context, id string, params ContractE
 
 // ContractExportParams are the query parameters for ContractExport.
 type ContractExportParams struct {
+	Terminator string
 	FromLedger int64
 	ToLedger   int64
 	Format     string
@@ -1013,6 +1092,9 @@ type ContractExportParams struct {
 // unset field is omitted from the URL rather than sent as empty.
 func (p ContractExportParams) values() url.Values {
 	v := url.Values{}
+	if p.Terminator != "" {
+		v.Set("terminator", p.Terminator)
+	}
 	if p.FromLedger != 0 {
 		v.Set("from_ledger", strconv.FormatInt(p.FromLedger, 10))
 	}
@@ -1047,6 +1129,42 @@ func (c *Client) GetContractSpecOverride(ctx context.Context, id string) (*GetCo
 func (c *Client) PutContractSpecOverride(ctx context.Context, id string, body ContractSpecOverrideRequest) (*PutContractSpecOverrideResponse, error) {
 	path := urlEscapePath("/contracts/{id}/spec", id)
 	return do[PutContractSpecOverrideResponse](c, ctx, "PUT", path, nil, body)
+}
+
+// ListContractSpecOverrideHistory List a contract's spec override history.
+//
+// GET /contracts/{id}/spec/history
+func (c *Client) ListContractSpecOverrideHistory(ctx context.Context, id string, params ListContractSpecOverrideHistoryParams) (*ListContractSpecOverrideHistoryResponse, error) {
+	path := urlEscapePath("/contracts/{id}/spec/history", id)
+	query := params.values()
+	return do[ListContractSpecOverrideHistoryResponse](c, ctx, "GET", path, query, nil)
+}
+
+// ListContractSpecOverrideHistoryParams are the query parameters for ListContractSpecOverrideHistory.
+type ListContractSpecOverrideHistoryParams struct {
+	Limit  int64
+	Cursor string
+}
+
+// values renders the non-zero fields as query parameters, so an
+// unset field is omitted from the URL rather than sent as empty.
+func (p ListContractSpecOverrideHistoryParams) values() url.Values {
+	v := url.Values{}
+	if p.Limit != 0 {
+		v.Set("limit", strconv.FormatInt(p.Limit, 10))
+	}
+	if p.Cursor != "" {
+		v.Set("cursor", p.Cursor)
+	}
+	return v
+}
+
+// RevertContractSpecOverride Restore a previous contract spec override.
+//
+// POST /contracts/{id}/spec/revert
+func (c *Client) RevertContractSpecOverride(ctx context.Context, id string, body ContractSpecOverrideRevertRequest) (*RevertContractSpecOverrideResponse, error) {
+	path := urlEscapePath("/contracts/{id}/spec/revert", id)
+	return do[RevertContractSpecOverrideResponse](c, ctx, "POST", path, nil, body)
 }
 
 // ContractStats Get per-contract statistics.
@@ -1276,6 +1394,7 @@ func (c *Client) EventsCSV(ctx context.Context, params EventsCSVParams) ([]byte,
 
 // EventsCSVParams are the query parameters for EventsCSV.
 type EventsCSVParams struct {
+	Terminator       string
 	ContractID       string
 	Type             string
 	Topic            string
@@ -1303,6 +1422,9 @@ type EventsCSVParams struct {
 // unset field is omitted from the URL rather than sent as empty.
 func (p EventsCSVParams) values() url.Values {
 	v := url.Values{}
+	if p.Terminator != "" {
+		v.Set("terminator", p.Terminator)
+	}
 	if p.ContractID != "" {
 		v.Set("contract_id", p.ContractID)
 	}
@@ -1921,6 +2043,7 @@ func (c *Client) RemoveWatchedContract(ctx context.Context, id string, params Re
 // RemoveWatchedContractParams are the query parameters for RemoveWatchedContract.
 type RemoveWatchedContractParams struct {
 	Confirm string
+	Network string
 }
 
 // values renders the non-zero fields as query parameters, so an
@@ -1929,6 +2052,9 @@ func (p RemoveWatchedContractParams) values() url.Values {
 	v := url.Values{}
 	if p.Confirm != "" {
 		v.Set("confirm", p.Confirm)
+	}
+	if p.Network != "" {
+		v.Set("network", p.Network)
 	}
 	return v
 }

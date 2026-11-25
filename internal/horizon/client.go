@@ -47,12 +47,19 @@ func NewHTTPClient(baseURL string, minInterval time.Duration) *HTTPClient {
 	}
 }
 
-// WithHTTPClient swaps the underlying transport (testing seam).
+// WithHTTPClient swaps the underlying transport (testing seam). A nil
+// client is ignored: swapping one in would leave every later request
+// panicking on a nil receiver, and there is no sensible meaning for
+// "no transport at all".
 func (c *HTTPClient) WithHTTPClient(hc *http.Client) *HTTPClient {
-	c.http = hc
+	if hc != nil {
+		c.http = hc
+	}
 	return c
 }
 
+// ListContractTransactions returns contractID's transactions from Horizon in
+// ascending ledger order. A limit outside 1..200 is clamped to 200.
 func (c *HTTPClient) ListContractTransactions(ctx context.Context, contractID, cursor string, limit int, includeFailed bool) (TransactionsResponse, error) {
 	if contractID == "" {
 		return TransactionsResponse{}, errors.New("horizon: contractID is required")
